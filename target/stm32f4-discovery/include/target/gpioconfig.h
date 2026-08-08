@@ -10,8 +10,8 @@
 
 #include <platform/gpio.h>
 
-#define GPIO_USART2_TX GPIO(GPIO_PORT_A, 2)
-#define GPIO_USART2_RX GPIO(GPIO_PORT_A, 3)
+#define GPIO_USARTx_TX GPIO(GPIO_PORT_A, 9)
+#define GPIO_USARTx_RX GPIO(GPIO_PORT_A, 10)
 
 #define GPIO_LED0 GPIO(GPIO_PORT_D, 13) // LD3 - Orange
 #define GPIO_LED1 GPIO(GPIO_PORT_D, 12) // LD4 - Green

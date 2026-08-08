@@ -21,23 +21,24 @@
 
 void target_early_init(void) {
 #ifdef DEBUG_UART
-#if DEBUG_UART == 2
-    gpio_config(GPIO_USART2_TX, GPIO_STM32_AF |
-                GPIO_STM32_AFn(GPIO_AF_USART2) | GPIO_PULLUP);
-    gpio_config(GPIO_USART2_RX, GPIO_STM32_AF |
-                GPIO_STM32_AFn(GPIO_AF_USART2) | GPIO_PULLUP);
+#if DEBUG_UART == 1
+    gpio_config(GPIO_USARTx_TX, GPIO_STM32_AF |
+                GPIO_STM32_AFn(GPIO_AF_USART1) | GPIO_PULLUP);
+    gpio_config(GPIO_USARTx_RX, GPIO_STM32_AF |
+                GPIO_STM32_AFn(GPIO_AF_USART1) | GPIO_PULLUP);
 #endif // DEBUG_UART == 2
 #else
 #warn DEBUG_UART only supports USART2!!!
 #endif // defined DEBUG_UART
 
     stm32_debug_early_init();
-
+#if 0
     /* configure some status leds */
     gpio_config(GPIO_LED0, GPIO_OUTPUT);
     gpio_config(GPIO_LED1, GPIO_OUTPUT);
     gpio_config(GPIO_LED2, GPIO_OUTPUT);
     gpio_config(GPIO_LED3, GPIO_OUTPUT);
+#endif
 }
 
 void target_init(void) {
