@@ -1,6 +1,6 @@
 # LK Kernel Development Guide
 
-LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with limited C++ (no STL, no exceptions).
+LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers.
 
 ## Architecture Overview
 
@@ -53,6 +53,7 @@ include make/module.mk
 - Must `include make/module.mk` at end of `rules.mk` to finalize the module definition
 - All MODULE_* variables are cleared after inclusion, preventing leakage between modules
 - Modules are built as separate ELF .o files and linked into the final kernel image
+- Modules that include any `std::` header must declare `MODULE_DEPS += lib/libcpp` (see `dev/bus/pci/rules.mk`)
 - Modules commonly export their include name space that matches the name of the module.
   - ie. lib/foo will export the include path `lib/foo.h` with any additioal headers under `lib/foo/`.
 
@@ -169,7 +170,35 @@ The do-qemu* scripts auto-build before launching QEMU.
 
 # For all architectures
 ./scripts/run-qemu-boot-tests.py
+
+# Raise the per-architecture timeout (default 30s) for longer suites
+./scripts/run-qemu-boot-tests.py --arch arm64 --timeout 600
 ```
+
+### Filesystem tests against a real disk image
+
+Most unit tests need nothing but the kernel. The FAT tests come in two tiers:
+the RAM backed ones format their own volume with `fs_format_device()` and run
+under the command above on every architecture, while the image based ones need a
+disk attached. `scripts/run-fat-tests.py` drives the latter end to end -- it
+builds the images, boots QEMU with one attached, and then verifies the result
+from the host with both `fsck.fat` and `mtools`:
+
+```bash
+# Build images and run the FAT tests on arm64 (needs dosfstools and mtools)
+./scripts/run-fat-tests.py
+
+# One image type, a different architecture, or the stress suite
+./scripts/run-fat-tests.py --type fat16
+./scripts/run-fat-tests.py --arch x86-64
+./scripts/run-fat-tests.py --stress
+
+# Rebuild the disk images by hand
+./lib/fs/fat/test/mkimage.py --force
+```
+
+It works on a scratch copy of each image and the in-guest tests clean up after
+themselves, so runs are repeatable without rebuilding the images.
 
 ## Code Conventions
 
@@ -207,7 +236,8 @@ For in-progress (WIP) work on a branch that is intended to be collapsed or merge
 
 - Base flags: `-Wall -Werror=return-type -Wshadow -Wdouble-promotion`
 - C-specific: `-Werror-implicit-function-declaration -Wstrict-prototypes`
-- C++: `-fno-exceptions -fno-rtti -fno-threadsafe-statics --std=c++14`
+- C++: `--std=c++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics -nostdinc++`
+  - `-nostdinc++` keeps the host toolchain's C++ headers out of the build; `std::` headers come from `lib/libcpp` only
 - All code compiled with `-ffreestanding` (no hosted environment assumptions)
 - `MODULE_OPTIONS := extra_warnings` adds `-Wmissing-declarations -Wredundant-decls`
 - When compiling with WERROR=1, all warnings are treated as errors.
@@ -335,14 +365,50 @@ Architecture/platform rules set defines via `GLOBAL_DEFINES +=`:
 ### Testing
 
 - Some Shell commands test individual subsystems interactively
-- `app/tests/` contains some unit test commands to run through the shell
+- `app/tests/` contains benchmarks and interactive/operator tools that are run through the shell
+  (`bench`, `cache_tests`, `clock_tests`, `fibo`, `mem_test`, `thread_tests`). These measure cycle
+  counts or need arguments, so they have no pass/fail criterion and are not unit tests.
 - `lib/unittest` contains a unit test framework that other libraries can use to define tests.
   - Tests are auto-discovered and run with `ut all` on the command line shell, or automatically
-    at boot time if `lk.unittests_at_boot=1` is passed in the kernel command line.
-- When a library adds its own unit tests, it should add a `tests/` subdirectory with test source
+    at boot time via the `lk.autorun` kernel command line variable (see below).
+  - Self-validating tests belong here, next to the code they exercise: `kernel/test/` covers the
+    thread, mutex, semaphore, event and port primitives plus the platform clock invariants,
+    `arch/test/` covers MMU and FPU context switching.
+- When a library adds its own unit tests, it should add a `test/` subdirectory with test source
   files and a `rules.mk` that defines a module for the tests. The module should have `MODULE_DEPS`
   on the library being tested. MODULE_OPTIONS of the parent module should have 'test' to ensure the
   tests module is only built when `WITH_TESTS` is enabled.
+- `ut all` runs at boot in CI under a 60 second per architecture timeout on emulated targets, so
+  keep individual tests fast: prefer joins and events over fixed sleeps, and keep iteration counts
+  low enough to stay well under a second on a slow emulator.
+
+### Running a script at boot (`lk.autorun`)
+
+If `app/shell` is in the build, the shell app looks for an `lk.autorun` kernel command line
+variable and runs its value as a shell script before dropping into the interactive shell.
+This is the preferred way to drive a target from a host script — start QEMU and tell it what
+to run, rather than adding a new command line variable per scenario.
+
+```bash
+# spaces encoded as '+', which avoids needing to quote anything along the way
+scripts/do-qemuarm -6 -A 'lk.autorun=sleep+5;ut+all;poweroff'
+
+# real spaces work too: the do-qemu* wrappers quote the value and lib/cmdline unquotes it
+# (don't add the quotes yourself, they'd end up quoted a second time)
+scripts/do-qemuarm -6 -A 'lk.autorun=sleep 5; ut all; poweroff'
+```
+
+- `+` decodes to a space in both forms, `++` decodes to a literal `+`.
+- Commands are separated with `;` or newlines (`\n` in the quoted form), same as any other
+  console script.
+- Ending the script with `poweroff` makes QEMU exit once the script is done, which is how
+  `scripts/run-qemu-boot-tests.py` drives its runs. Note `poweroff` is only registered when
+  `LK_DEBUGLEVEL > 1` (i.e. the default `DEBUG=2`).
+- The script is capped at 511 bytes. On PC targets `platform/pc` copies the multiboot command
+  line into a 256 byte buffer, which caps the *entire* command line there.
+- The script runs on the shell app's thread, whose stack size can be overridden with
+  `SHELL_STACK_SIZE` (`DEFAULT_STACK_SIZE` by default). Commands like `ut all` run close
+  to the default stack size, so keep large buffers in tests on the heap, not the stack.
 
 ## Key Files Reference
 
@@ -352,6 +418,7 @@ Architecture/platform rules set defines via `GLOBAL_DEFINES +=`:
 - `kernel/thread.c` - Threading and scheduler implementation
 - `kernel/vm/` - Virtual memory subsystem (for MMU architectures)
 - `lib/libc/` - Minimal C library (string, stdio, stdlib basics)
+- `lib/libcpp/` - Freestanding subset of the C++ standard library (headers in `lib/libcpp/include/`)
 - `top/` - Top level module in the system. Contains the kernel's lk_main() system init routines.
    Also contains top level lk/ include headers.
 
