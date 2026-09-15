@@ -72,9 +72,6 @@ status_t virtio_9p_init(virtio_device *dev, uint32_t host_features)
     mutex_init(&p9dev->req_lock);
     p9dev->msize = VIRTIO_9P_DEFAULT_MSIZE;
 
-    // Add the 9p device to the device list
-    list_add_tail(&p9_devices, &p9dev->list);
-
     /* make sure the device is reset */
     dev->bus()->virtio_reset_device();
 
@@ -94,6 +91,19 @@ status_t virtio_9p_init(virtio_device *dev, uint32_t host_features)
 
     /* ack and set the driver status bit */
     dev->bus()->virtio_status_acknowledge_driver();
+
+    /* confirm the feature set before configuring the queue */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-9p: device rejected feature negotiation\n");
+        dev->set_priv(nullptr);
+        free(p9dev);
+        return err;
+    }
+
+    // Add the 9p device to the device list. Done after the feature check so a device that
+    // rejects the feature set does not leave a half initialized entry behind.
+    list_add_tail(&p9_devices, &p9dev->list);
 
     dev->virtio_alloc_ring(VIRTIO_9P_RING_IDX, VIRTIO_9P_RING_SIZE);
 

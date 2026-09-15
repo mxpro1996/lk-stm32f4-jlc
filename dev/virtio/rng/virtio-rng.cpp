@@ -8,6 +8,8 @@
 
 #include <dev/virtio/rng.h>
 
+#include <algorithm>
+
 #include <dev/virtio/virtio-device.h>
 #include <dev/virtio/virtio_ring.h>
 #include <kernel/event.h>
@@ -69,17 +71,23 @@ status_t virtio_rng_init(virtio_device *dev) {
     dprintf(INFO, "virtio-rng: modern config %u, expecting %s-endian config\n",
             modern, modern ? "little" : "native");
 
-    /* ack and set the driver status bit */
+    /* ack and set the driver status bit. The transport negotiates the mandatory
+     * VERSION_1 bit for us on the modern transports. */
     dev->bus()->virtio_status_acknowledge_driver();
 
-    /* negotiate mandatory VERSION_1 for modern transports (feature bit 32) */
-    constexpr uint32_t version1_bit_word1 = 1u << 0;
-    uint32_t host_features_word1 = dev->bus()->virtio_read_host_feature_word(1);
-    if (host_features_word1 & version1_bit_word1) {
-        dev->bus()->virtio_set_guest_features(1, version1_bit_word1);
+    /* virtio-rng has no device specific feature bits to negotiate, so the feature set is
+     * already final here. Confirm it before configuring the queue: the spec requires
+     * FEATURES_OK to be set and read back before any queue is touched. */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-rng: device rejected feature negotiation\n");
+        return err;
     }
 
-    status_t err = dev->virtio_alloc_ring(RNG_QUEUE_INDEX, 32);
+    /* only one request is ever outstanding, so any ring the device offers is enough.
+     * QEMU's virtio-rng has an 8 entry queue. */
+    uint16_t ring_len = std::min<uint16_t>(32, dev->bus()->virtio_queue_max_size(RNG_QUEUE_INDEX));
+    err = dev->virtio_alloc_ring(RNG_QUEUE_INDEX, ring_len);
     if (err != NO_ERROR) {
         TRACEF("virtio-rng: Failed to allocate virtqueue\n");
         return err;

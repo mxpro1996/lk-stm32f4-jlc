@@ -24,21 +24,55 @@
 #include "bus.h"
 #include "bridge.h"
 #include "resource.h"
+#include "root.h"
 
 #define LOCAL_TRACE 0
 
 // global state of the pci bus manager
 namespace pci {
 
-// root of the pci bus
-bus *root = nullptr;
-list_node bus_list = LIST_INITIAL_VALUE(bus_list);
+// all of the roots (host bridges) in the system, and every bus hanging off of them
+lk::list<root> root_list;
+lk::list<bus> bus_list;
 
 namespace {
 
-uint8_t last_bus = 0;
+// set once pci_bus_mgr_init has run
+bool initialized = false;
 
-resource_allocator resources;
+// the root created when the platform registers none of its own
+root *default_root = nullptr;
+
+// find or create the default root
+root *get_default_root() {
+    if (default_root) {
+        return default_root;
+    }
+
+    // covers segment 0 from bus 0 through whatever the config accessors can reach
+    pci_root_desc desc = {};
+    desc.segment = 0;
+    desc.bus_start = 0;
+    int last_bus = pci_get_last_bus();
+    desc.bus_end = (last_bus < 0) ? 255 : (uint8_t)last_bus;
+
+    default_root = new root(desc);
+    root_list.push_back(default_root);
+    return default_root;
+}
+
+template <typename F>
+status_t for_every_root(F func) {
+    status_t err = NO_ERROR;
+
+    for (root &r : root_list) {
+        err = func(&r);
+        if (err != NO_ERROR) {
+            return err;
+        }
+    }
+    return err;
+}
 
 // local helper routines
 // iterate all devices on all busses with the functor
@@ -46,9 +80,8 @@ template <typename F>
 status_t for_every_device_on_every_bus(F func) {
     status_t err = NO_ERROR;
 
-    bus *b;
-    list_for_every_entry(&bus_list, b, bus, node) {
-        err = b->for_every_device(func);
+    for (bus &b : bus_list) {
+        err = b.for_every_device(func);
         if (err != NO_ERROR) {
             return err;
         }
@@ -60,9 +93,8 @@ template <typename F>
 status_t for_every_bus(F func) {
     status_t err = NO_ERROR;
 
-    bus *b;
-    list_for_every_entry(&bus_list, b, bus, node) {
-        err = func(b);
+    for (bus &b : bus_list) {
+        err = func(&b);
         if (err != NO_ERROR) {
             return err;
         }
@@ -91,30 +123,14 @@ device *lookup_device_by_loc(pci_location_t loc) {
 
 // used by bus object to stuff itself into a global list
 void add_to_bus_list(bus *b) {
-    list_add_tail(&bus_list, b->list_node_ptr());
+    bus_list.push_back(b);
 }
 
-void set_last_bus(uint8_t bus) {
-    LTRACEF("bus %hhu, existing last_bus %hhu\n", bus, last_bus);
-    DEBUG_ASSERT_MSG(bus >= last_bus, "bus %u, last_bus %u\n", bus, last_bus);
-
-    last_bus = bus;
-}
-
-// allocate the next bus (used when assigning busses to bridges)
-uint8_t allocate_next_bus() {
-    return ++last_bus;
-}
-
-uint8_t get_last_bus() {
-    return last_bus;
-}
-
-// find a bus by number
-bus *lookup_bus(uint8_t bus_num) {
+// find a bus by segment and number
+bus *lookup_bus(uint16_t segment, uint8_t bus_num) {
     bus *found_bus = nullptr;
     auto b_finder = [&](bus *b) -> status_t {
-        if (bus_num == b->bus_num()) {
+        if (segment == b->loc().segment && bus_num == b->bus_num()) {
             found_bus = b;
             return 1;
         }
@@ -130,31 +146,77 @@ bus *lookup_bus(uint8_t bus_num) {
 // C api, so outside of the namespace
 using namespace pci;
 
+status_t pci_bus_mgr_add_root(const struct pci_root_desc *desc) {
+    if (!desc || desc->bus_end < desc->bus_start) {
+        return ERR_INVALID_ARGS;
+    }
+    if (initialized) {
+        return ERR_BAD_STATE;
+    }
+
+    LTRACEF("segment %u bus [%u...%u] %zu windows\n", desc->segment, desc->bus_start,
+            desc->bus_end, desc->num_windows);
+
+    // reject roots that overlap an existing one
+    for (const root &r : root_list) {
+        if (r.segment() == desc->segment && desc->bus_start <= r.bus_end() &&
+            desc->bus_end >= r.bus_start()) {
+            printf("PCI: root %04x:[%02x...%02x] overlaps an existing root\n", desc->segment,
+                   desc->bus_start, desc->bus_end);
+            return ERR_ALREADY_EXISTS;
+        }
+    }
+
+    root *r = new root(*desc);
+    root_list.push_back(r);
+    return NO_ERROR;
+}
+
+status_t pci_bus_mgr_add_resource(enum pci_resource_type type, uint64_t mmio_base, uint64_t len) {
+    LTRACEF("type %d: mmio base %#llx len %#llx\n", type, mmio_base, len);
+
+    if (initialized) {
+        return ERR_BAD_STATE;
+    }
+
+    pci_root_window w = {};
+    w.type = type;
+    w.base = mmio_base;
+    w.size = len;
+    return get_default_root()->add_window(w);
+}
+
 status_t pci_bus_mgr_init() {
     LTRACE_ENTRY;
 
-    // start drilling into the pci bus tree
-    pci_location_t loc;
-
-    loc = {}; // start at 0:0:0.0
-
-    bus *b;
-    // TODO: deal with root bus not having reference to bridge device
-    status_t err = bus::probe(loc, nullptr, &b, true);
-    if (err < 0) {
-        printf("PCI: failed to probe bus, error %d\n", err);
-        return err;
+    if (initialized) {
+        return ERR_BAD_STATE;
     }
 
-    // if we found anything there should be at least an empty bus device
-    DEBUG_ASSERT(b);
-    root = b;
-    list_add_head(&bus_list, b->list_node_ptr());
+    // if the platform didn't register any roots, make one up covering segment 0
+    if (root_list.is_empty()) {
+        get_default_root();
+    }
+
+    // scan every root, keep going if one of them fails
+    status_t final_err = NO_ERROR;
+    for_every_root([&](root *r) -> status_t {
+        status_t err = r->probe();
+        if (err != NO_ERROR) {
+            final_err = err;
+        }
+        return NO_ERROR;
+    });
+
+    initialized = true;
 
     // iterate over all the devices found
     if (LK_DEBUGLEVEL >= SPEW) {
         printf("PCI dump:\n");
-        root->dump(2);
+        for_every_root([](root *r) -> status_t {
+            r->dump(1);
+            return NO_ERROR;
+        });
     }
 
     if (LOCAL_TRACE) {
@@ -165,39 +227,54 @@ status_t pci_bus_mgr_init() {
         });
     }
 
-    return NO_ERROR;
-}
-
-status_t pci_bus_mgr_add_resource(enum pci_resource_type type, uint64_t mmio_base, uint64_t len) {
-    LTRACEF("type %d: mmio base %#llx len %#llx\n", type, mmio_base, len);
-
-    resource_range r = {};
-    r.type = type;
-    r.base = mmio_base;
-    r.size = len;
-    return resources.set_range(r);
+    return final_err;
 }
 
 status_t pci_bus_mgr_assign_resources() {
-    LTRACE_ENTRY;
+    return pci_bus_mgr_assign_resources_mode(PCI_ASSIGN_ALL);
+}
 
-    if (!root) {
+status_t pci_bus_mgr_assign_resources_mode(enum pci_assign_mode mode) {
+    LTRACEF("mode %d\n", mode);
+
+    if (!initialized) {
+        return ERR_NOT_READY;
+    }
+
+    status_t final_err = NO_ERROR;
+    for_every_root([&](root *r) -> status_t {
+        status_t err = r->assign_resources(mode);
+        if (err != NO_ERROR) {
+            printf("PCI: error %d assigning resources to devices on root %04x:%02x\n", err,
+                   r->segment(), r->bus_start());
+            final_err = err;
+        }
         return NO_ERROR;
-    }
-
-    status_t err = root->allocate_resources(resources);
-    if (err != NO_ERROR) {
-        printf("PCI: error assigning resources to devices\n");
-        return err;
-    }
+    });
 
     // iterate over all the devices found
     if (LK_DEBUGLEVEL >= SPEW) {
         printf("PCI dump post assign:\n");
-        root->dump(2);
+        for_every_root([](root *r) -> status_t {
+            r->dump(1);
+            return NO_ERROR;
+        });
     }
 
-    return NO_ERROR;
+    return final_err;
+}
+
+void pci_bus_mgr_dump() {
+    if (!initialized) {
+        printf("PCI: bus manager not initialized\n");
+        return;
+    }
+
+    for_every_root([](root *r) -> status_t {
+        r->dump(1);
+        r->allocator().dump();
+        return NO_ERROR;
+    });
 }
 
 // for every bus in the system, pass the visit routine to the device

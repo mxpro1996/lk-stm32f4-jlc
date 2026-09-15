@@ -43,4 +43,17 @@ __END_CDECLS
 #define ARCH_CACHE_FLAG_UCACHE (ARCH_CACHE_FLAG_ICACHE | ARCH_CACHE_FLAG_DCACHE)
 
 /* include the arch specific implementations */
+/* TODO: untangle the mutual include between this header and every arch_ops.h,
+ * which includes this file back at its top. Anything here that depends on what
+ * the arch defined, like the default below, has to be gated on a macro the arch
+ * sets before that include, so a generic overridable default cannot simply
+ * follow the include. */
 #include <arch/arch_ops.h>
+
+/* Hint that the caller is spinning waiting on another cpu. An arch with a
+ * pause or yield instruction defines its own in arch_ops.h and sets
+ * ARCH_HAS_SPINLOOP_PAUSE before including this file; everyone else gets this
+ * empty one. */
+#if !defined(ASSEMBLY) && !defined(ARCH_HAS_SPINLOOP_PAUSE)
+static inline void arch_spinloop_pause(void) {}
+#endif

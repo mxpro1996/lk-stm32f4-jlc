@@ -59,7 +59,10 @@ define MAKECONFIGHEADER
 	$(call TESTANDREPLACEFILE,$1.tmp,$1)
 endef
 
-check_compiler_flag = $(shell $(CC) -c -xc /dev/null -o /dev/null $(1) 2>/dev/null && echo yes || echo no)
+# Note: no -c here. The only caller passes -fsyntax-only, and clang errors out
+# with -Wunused-command-line-argument (promoted by the -Werror the caller also
+# passes) if -c is combined with it, which made every probe answer 'no'.
+check_compiler_flag = $(shell $(CC) -xc /dev/null -o /dev/null $(1) 2>/dev/null && echo yes || echo no)
 # Due to GCC's behaviour with regard to unknown warning flags this macro can
 # only be used to detect warning-enable options (-Wfoo) but not for warning
 # disable flags such as -Wno-foo.

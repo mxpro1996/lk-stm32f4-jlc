@@ -9,6 +9,7 @@
 
 #include <arch/ops.h>
 #include <arch/x86.h>
+#include <arch/x86/clocks.h>
 #include <arch/x86/feature.h>
 #include <arch/x86/mp.h>
 #include <assert.h>
@@ -23,6 +24,8 @@
 #include <lk/reg.h>
 #include <lk/trace.h>
 #include <platform/interrupts.h>
+#include <platform/pc.h>
+#include <platform/pc/hpet.h>
 #include <platform/pc/timer.h>
 #include <platform/time.h>
 #include <platform/timer.h>
@@ -201,7 +204,7 @@ static enum handler_return lapic_spurious_handler(void *arg) {
 static enum handler_return lapic_generic_handler(void *arg) {
     LTRACEF("cpu %u, arg %p\n", arch_curr_cpu_num(), arg);
 
-    return INT_NO_RESCHEDULE;
+    return mp_mbx_generic_irq();
 }
 
 static enum handler_return lapic_reschedule_handler(void *arg) {
@@ -264,6 +267,9 @@ void lapic_init_postvm(void) {
     if (eas) {
         dprintf(INFO, "X86: local apic EAS features %#x\n", lapic_read(LAPIC_EXT_FEATURES));
     }
+    if (x86_feature_test(X86_FEATURE_ARAT)) {
+        dprintf(INFO, "X86: local apic timer is always running (ARAT)\n");
+    }
 
     // Finish up some local initialization that all cpus will want to do
     lapic_init_percpu(0);
@@ -281,9 +287,9 @@ static void lapic_init_percpu(uint level) {
 
     LTRACEF("lapic svr %#x\n", lapic_read(LAPIC_SVR));
 
-    register_int_handler_msi(LAPIC_INT_SPURIOUS, &lapic_spurious_handler, NULL, false);
-    register_int_handler_msi(LAPIC_INT_GENERIC, &lapic_generic_handler, NULL, false);
-    register_int_handler_msi(LAPIC_INT_RESCHEDULE, &lapic_reschedule_handler, NULL, false);
+    register_int_handler_lapic(LAPIC_INT_SPURIOUS, &lapic_spurious_handler, NULL, false);
+    register_int_handler_lapic(LAPIC_INT_GENERIC, &lapic_generic_handler, NULL, true);
+    register_int_handler_lapic(LAPIC_INT_RESCHEDULE, &lapic_reschedule_handler, NULL, true);
 }
 LK_INIT_HOOK_FLAGS(lapic_init_percpu, lapic_init_percpu, LK_INIT_LEVEL_VM,
                    LK_INIT_FLAG_SECONDARY_CPUS);
@@ -298,6 +304,25 @@ void lapic_enable_on_local_cpu(void) {
         apic_base |= (1u << 10);
     }
     write_msr(X86_MSR_IA32_APIC_BASE, apic_base);
+}
+
+bool lapic_is_x2apic(void) {
+    return lapic_x2apic;
+}
+
+bool lapic_is_present(void) {
+    return lapic_present;
+}
+
+void lapic_mask_lint0(void) {
+    if (!lapic_present) {
+        return;
+    }
+
+    // LINT0 is the 8259's ExtINT input in virtual wire mode. once the ioapic delivers the
+    // legacy interrupts there is nothing useful on it, so mask it. LINT1 is left alone since
+    // firmware typically routes NMI through it.
+    lapic_write(LAPIC_LINT0, lapic_read(LAPIC_LINT0) | (1u << 16));
 }
 
 uint32_t lapic_get_apic_id(void) {
@@ -335,7 +360,7 @@ static void lapic_timer_init_percpu(uint level) {
     }
 
     // register the timer interrupt vector
-    register_int_handler_msi(LAPIC_INT_TIMER, &lapic_timer_handler, NULL, false);
+    register_int_handler_lapic(LAPIC_INT_TIMER, &lapic_timer_handler, NULL, true);
 }
 LK_INIT_HOOK_FLAGS(lapic_timer_init_percpu, lapic_timer_init_percpu, LK_INIT_LEVEL_VM + 1,
                    LK_INIT_FLAG_SECONDARY_CPUS);
@@ -355,11 +380,24 @@ status_t lapic_timer_init(bool invariant_tsc_supported) {
         uint32_t val = (LAPIC_TIMER_MODE_ONESHOT << 17) | LAPIC_INT_TIMER;
         lapic_write(LAPIC_TIMER, val);
 
-        // calibrate the timer frequency
-        lapic_write(LAPIC_TICR, 0xffffffff); // countdown from the max count
-        uint32_t lapic_hz = pit_calibrate_lapic(&lapic_read_current_tick);
-        lapic_write(LAPIC_TICR, 0);
-        printf("X86: local apic timer frequency %uHz\n", lapic_hz);
+        // Find the timer frequency. Best to worst: the cpu enumerates it exactly, a
+        // measurement against the HPET's free-running counter, a measurement against
+        // the PIT (which on modern parts is emulated by firmware and not to be trusted).
+        uint32_t lapic_hz = x86_cpu_lapic_timer_hz();
+        const char *source = "cpuid";
+        if (lapic_hz == 0) {
+            lapic_write(LAPIC_TICR, 0xffffffff); // countdown from the max count
+            if (hpet_is_available()) {
+                lapic_hz = hpet_calibrate_lapic(&lapic_read_current_tick);
+                source = "HPET";
+            }
+            if (lapic_hz == 0) {
+                lapic_hz = pit_calibrate_lapic(&lapic_read_current_tick);
+                source = "PIT";
+            }
+            lapic_write(LAPIC_TICR, 0);
+        }
+        printf("X86: local apic timer frequency %uHz (from %s)\n", lapic_hz, source);
 
         fp_32_64_div_32_32(&timebase_to_lapic, lapic_hz, 1000);
         char ratio_buf[32];

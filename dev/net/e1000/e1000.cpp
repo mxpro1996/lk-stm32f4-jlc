@@ -6,6 +6,7 @@
 // https://opensource.org/licenses/MIT
 
 #include <arch/atomic.h>
+#include <arch/ops.h>
 #include <dev/bus/pci.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
@@ -19,11 +20,58 @@
 #include <lk/list.h>
 #include <lk/reg.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <platform/interrupts.h>
 #include <string.h>
 
 #include "e1000_hw.h"
 #include "e1000_ids.h"
+
+// NOTE ON CACHE COHERENCY
+//
+// This driver assumes DMA is cache coherent. That holds on every bus it is reachable on today
+// (PCI on x86, and PCIe on the arm64 qemu virt machine), so the descriptor rings and the packet
+// buffers are ordinary cached memory and ordering is done with barriers alone: wmb() before the
+// TDT/RDT doorbells, rmb() after the TDH/RDH reads and after observing RXD_STAT_DD.
+//
+// The rings used to be mapped uncached with no barriers at all. That had to change because an
+// uncached guest mapping is broken under KVM on an ARM core without FEAT_S2FWB (ARMv8.4): the
+// guest's uncached accesses and the VMM's cached view of the same page never see each other.
+// See the comment in virtio_device::virtio_alloc_ring().
+//
+// A real e1000 behind a non-coherent interconnect -- an actual ARM SoC rather than an emulated
+// PCIe device -- would need more than barriers, and this driver does not do any of it:
+//
+//   - TX: the packet data and the descriptor have to be cleaned to the point of coherency before
+//     the TDT write, and the descriptor invalidated before its writeback status is read.
+//   - RX: the buffer and the descriptor have to be invalidated before they are read, so the DMA'd
+//     data is not shadowed by a stale line.
+//   - The descriptor rings would have to stop being cached, or be padded. rdesc and tdesc are 16
+//     bytes, so four share a 64 byte line, and invalidating a line to pick up one descriptor's
+//     writeback would discard driver writes to the three next to it. Keeping the rings uncached,
+//     which is what they were before, is the usual answer -- and it directly conflicts with what
+//     KVM on ARM needs, so a port to a non-coherent target would have to make the mapping a
+//     platform choice rather than the constant it is here.
+//
+// The buffers are at least shaped for it already: the rx buffers are cache line aligned 2048 byte
+// slices of one allocation, and pktbuf pool objects are cache line aligned and a whole number of
+// lines long, so no buffer shares a line with another one.
+//
+// Two things are missing before any of that could be written, and neither is local to this file:
+//
+//   - A Normal Non-cacheable memory attribute. Both of the uncached arch mmu flags are Device
+//     types (ARCH_MMU_FLAG_UNCACHED is Device-nGnRnE, ARCH_MMU_FLAG_UNCACHED_DEVICE is
+//     Device-nGnRE; see MMU_MAIR_VAL in arch/arm64/include/arch/arm64/mmu.h), and Device is the
+//     wrong tool for a ring: it forbids speculation, preserves access size, requires strict
+//     alignment and cannot merge writes, all of which are there for MMIO and merely slow here.
+//     Linux allocates non-coherent DMA memory as Normal Non-cacheable for exactly this reason
+//     (arm64's pgprot_dmacoherent()); LK has no such MAIR entry to allocate against.
+//
+//   - A per device notion of whether DMA is coherent, rather than one answer compiled into each
+//     driver. That is what lets one driver source work on both kinds of system: firmware says
+//     which it is (`dma-coherent` in a device tree, _CCA in ACPI) and the allocation and the
+//     maintenance follow from that. Note qemu sets `dma-coherent` on the root node of the virt
+//     machine's tree, so a guest that honored it would arrive at what this driver hardcodes.
 
 #define LOCAL_TRACE 0
 
@@ -203,6 +251,8 @@ handler_return e1000::irq_handler() {
     if (icr & E1000_ICR_TXDW) { // TXDW - transmit descriptor written back
         // Walk from last known head to current TDH, freeing completed TX pktbufs.
         auto tdh = read_reg(e1000_reg::TDH);
+        // Order the descriptor and pktbuf accesses below after the TDH read.
+        rmb();
         while (tx_last_head_ != tdh) {
             if (tx_pktbuf_[tx_last_head_]) {
                 pktbuf_free(tx_pktbuf_[tx_last_head_], false);
@@ -233,6 +283,9 @@ handler_return e1000::irq_handler() {
         // Packets may be ready, or descriptors may need draining after overrun.
         auto rdh = read_reg(e1000_reg::RDH);
         auto rdt = read_reg(e1000_reg::RDT);
+        // The ring is normal cached memory, so the descriptor reads below have to be
+        // explicitly ordered after these register reads.
+        rmb();
 
         while (rx_last_head_ != rdh) {
             // copy the current rx descriptor locally for better cache performance
@@ -251,6 +304,10 @@ handler_return e1000::irq_handler() {
 
             bool consumed_pkt = false;
             if (rxd.status & E1000_RXD_STAT_DD) { // descriptor done, we own it now
+                // DD is what tells us the device has finished writing the buffer, so the
+                // reads of the received data have to be ordered after observing it.
+                rmb();
+
                 bool eop = (rxd.status & E1000_RXD_STAT_EOP);
 
                 if (rxd.errors == 0) {
@@ -372,8 +429,10 @@ int e1000::tx(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     tx_pktbuf_[tx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor and the packet it points at must be visible to the
+    // device before the tail register hands the descriptor over.
     tx_tail_ = (tx_tail_ + 1) % txring_len;
+    wmb();
     write_reg(e1000_reg::TDT, tx_tail_);
 
     LTRACEF("TDH %#x TDT %#x\n", read_reg(e1000_reg::TDH), read_reg(e1000_reg::TDT));
@@ -394,8 +453,10 @@ void e1000::add_pktbuf_to_rxring_locked(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     rx_pktbuf_[rx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor must be visible to the device before the tail
+    // register hands it over.
     rx_tail_ = (rx_tail_ + 1) % rxring_len;
+    wmb();
     write_reg(e1000_reg::RDT, rx_tail_);
 
     LTRACEF("after RDH %#x RDT %#x\n", read_reg(e1000_reg::RDH), read_reg(e1000_reg::RDT));
@@ -480,10 +541,12 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     printf("e1000 %d: mac address %02x:%02x:%02x:%02x:%02x:%02x\n", unit_, mac_addr_[0],
            mac_addr_[1], mac_addr_[2], mac_addr_[3], mac_addr_[4], mac_addr_[5]);
 
-    // allocate and map space for the rx and tx ring
+    // Allocate and map space for the rx and tx ring. Mapped cached, with the barriers around the
+    // head/tail registers doing the ordering; see the note on cache coherency at the top of this
+    // file for what that assumes.
     snprintf(str, sizeof(str), "e1000 %d rxring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, rxring_len * sizeof(rdesc),
-                               reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
@@ -494,11 +557,11 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
 
     snprintf(str, sizeof(str), "e1000 %d txring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, txring_len * sizeof(tdesc),
-                               reinterpret_cast<void **>(&txring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&txring_), 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
-    memset(txring_, 0, txring_len * sizeof(rdesc));
+    memset(txring_, 0, txring_len * sizeof(tdesc));
 
     paddr_t txring_phys = vaddr_to_paddr(txring_);
     LTRACEF("tx ring at %p, physical %#lx\n", txring_, txring_phys);

@@ -23,6 +23,7 @@
 #include <kernel/mp.h>
 #include <kernel/timer.h>
 #include <lib/heap.h>
+#include <lk/backtrace.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/list.h>
@@ -105,9 +106,9 @@ static void wakeup_cpu_for_thread(thread_t *t)
      * or wake up all if thread is unpinned */
     int pinned_cpu = thread_pinned_cpu(t);
     if (pinned_cpu < 0)
-        mp_reschedule(MP_CPU_ALL_BUT_LOCAL, 0);
+        mp_reschedule(MP_IPI_TARGET_ALL_BUT_LOCAL, 0, 0);
     else
-        mp_reschedule(1U << pinned_cpu, 0);
+        mp_reschedule(MP_IPI_TARGET_MASK, 1U << pinned_cpu, 0);
 }
 
 static void init_thread_struct(thread_t *t, const char *name) {
@@ -978,6 +979,11 @@ static size_t thread_stack_used(const thread_t *t) {
 /**
  * @brief  Dump debugging info about the specified thread.
  */
+/* Architectures that can walk a stack override this. */
+__WEAK bool arch_thread_get_backtrace_regs(const thread_t *t, uintptr_t *pc, uintptr_t *fp) {
+    return false;
+}
+
 void dump_thread(const thread_t *t) {
     dprintf(INFO, "dump_thread: t %p (%s)\n", t, t->name);
 #if WITH_SMP
@@ -1007,6 +1013,16 @@ void dump_thread(const thread_t *t) {
     dprintf(INFO, "\n");
 #endif
     arch_dump_thread(t);
+
+    /* A running thread's registers are in the cpu rather than in its saved
+     * frame, so only a parked one can be walked from the outside.
+     */
+    if (t->state != THREAD_RUNNING) {
+        uintptr_t pc, fp;
+        if (arch_thread_get_backtrace_regs(t, &pc, &fp)) {
+            backtrace_print_thread(t, pc, fp);
+        }
+    }
 }
 
 void dump_all_threads_unlocked(void) {
@@ -1207,7 +1223,8 @@ int wait_queue_wake_one(wait_queue_t *wait, bool reschedule, status_t wait_queue
 int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue_error) {
     thread_t *t;
     int ret = 0;
-    uint32_t cpu_mask = 0;
+    mp_ipi_target_t target = MP_IPI_TARGET_MASK;
+    mp_cpu_mask_t cpu_mask = 0;
 
     thread_t *current_thread = get_current_thread();
 
@@ -1233,8 +1250,8 @@ int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue
         t->blocking_wait_queue = NULL;
         int pinned_cpu = thread_pinned_cpu(t);
         if (pinned_cpu < 0) {
-            /* assumes MP_CPU_ALL_BUT_LOCAL is defined as all bits on */
-            cpu_mask = MP_CPU_ALL_BUT_LOCAL;
+            /* an unpinned thread may land anywhere, so every cpu gets a look */
+            target = MP_IPI_TARGET_ALL_BUT_LOCAL;
         } else {
             cpu_mask |= (1U << pinned_cpu);
         }
@@ -1245,7 +1262,7 @@ int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue
     DEBUG_ASSERT(wait->count == 0);
 
     if (ret > 0) {
-        mp_reschedule(cpu_mask, 0);
+        mp_reschedule(target, cpu_mask, 0);
         if (reschedule) {
             thread_resched();
         }

@@ -6,10 +6,13 @@
  * https://opensource.org/licenses/MIT
  */
 #include <stdio.h>
+#include <lk/backtrace.h>
 #include <lk/debug.h>
 #include <lk/bits.h>
+#include <lk/err.h>
 #include <arch/arch_ops.h>
 #include <arch/arm64.h>
+#include <kernel/thread.h>
 
 #define SHUTDOWN_ON_FATAL 1
 
@@ -150,11 +153,40 @@ static void dump_iframe(const struct arm64_iframe_long *iframe) {
     printf("x28 0x%16llx x29 0x%16llx lr  0x%16llx usp 0x%16llx\n", iframe->r[28], iframe->r[29], iframe->lr, iframe->usp);
     printf("elr 0x%16llx\n", iframe->elr);
     printf("spsr 0x%16llx\n", iframe->spsr);
-    arch_stacktrace(iframe->r[29], iframe->elr);
+    backtrace_print(iframe->elr, iframe->r[29]);
+}
+
+/* taken from EL0: spsr.M[3:2] holds the exception level, for aarch32 modes too */
+static inline bool iframe_from_user(const struct arm64_iframe_long *iframe) {
+    return BITS_SHIFT(iframe->spsr, 3, 2) == 0;
+}
+
+void arm64_syscall_unhandled(struct arm64_iframe_long *iframe, bool is_64bit) {
+    printf("unhandled %s syscall from user space in thread %s\n",
+           is_64bit ? "aarch64" : "aarch32", get_current_thread()->name);
+    dump_iframe(iframe);
+    thread_exit(ERR_NOT_SUPPORTED);
+}
+
+void arm64_user_exception_unhandled(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) {
+    uint32_t ec = BITS_SHIFT(esr, 31, 26);
+    uint32_t iss = BITS(esr, 24, 0);
+
+    printf("unhandled exception from user space in thread %s: ESR 0x%x (ec 0x%x, iss 0x%x), FAR 0x%llx\n",
+           get_current_thread()->name, esr, ec, iss, far);
+    if (ec == 0b100000 || ec == 0b100100) {
+        print_fault_msg(BITS(iss, 5, 0));
+    }
+    dump_iframe(iframe);
+    thread_exit(ERR_FAULT);
 }
 
 __WEAK void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit) {
-    panic("unhandled syscall vector\n");
+    arm64_syscall_unhandled(iframe, is_64bit);
+}
+
+__WEAK void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) {
+    arm64_user_exception_unhandled(iframe, esr, far);
 }
 
 void arm64_sync_exception(struct arm64_iframe_long *iframe);
@@ -166,7 +198,7 @@ void arm64_sync_exception(struct arm64_iframe_long *iframe) {
     uint32_t iss = BITS(esr, 24, 0);
 
     switch (ec) {
-        case 0b000111: /* floating point */
+        case 0b000111: /* floating point, first use since the last switch, from either EL */
             arm64_fpu_exception(iframe);
             return;
         case 0b010001: /* syscall from arm32 */
@@ -181,6 +213,17 @@ void arm64_sync_exception(struct arm64_iframe_long *iframe) {
             arm64_syscall(iframe, (ec == 0x15) ? true : false);
             return;
 #endif
+        default:
+            break;
+    }
+
+    /* anything else user space did is its own problem, not the kernel's */
+    if (iframe_from_user(iframe)) {
+        arm64_user_exception(iframe, esr, ARM64_READ_SYSREG(far_el1));
+        return;
+    }
+
+    switch (ec) {
         case 0b100000: /* instruction abort from lower level */
         case 0b100001: /* instruction abort from same level */
             printf("instruction abort: PC at 0x%llx\n", iframe->elr);

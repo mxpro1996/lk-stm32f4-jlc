@@ -9,6 +9,11 @@
 
 #ifndef ASSEMBLY
 
+/* before arch/ops.h so it leaves out its empty arch_spinloop_pause(); only
+ * these ISAs have the yield hint */
+#if ARM_ISA_ARMV7 || ARM_ISA_ARMV8 || ARM_ISA_ARMV6M || ARM_ISA_ARMV7M || ARM_ISA_ARMV8M
+#define ARCH_HAS_SPINLOOP_PAUSE 1
+#endif
 #include <arch/ops.h>
 #include <stdbool.h>
 #include <lk/compiler.h>
@@ -44,6 +49,11 @@ static inline bool arch_fiqs_disabled(void) {
     return !!state;
 }
 
+#if ARCH_HAS_SPINLOOP_PAUSE
+static inline void arch_spinloop_pause(void) {
+    __asm__ volatile("yield" ::: "memory");
+}
+#endif
 
 static inline ulong arch_cycle_count(void) {
 #if ARM_ISA_ARMV7M || ARM_ISA_ARMV8M

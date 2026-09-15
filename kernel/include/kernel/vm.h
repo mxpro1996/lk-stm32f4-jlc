@@ -245,7 +245,8 @@ status_t vmm_free_region(vmm_aspace_t *aspace, vaddr_t va);
 status_t vmm_create_aspace(vmm_aspace_t **aspace, const char *name, uint flags)
 __NONNULL((1));
 
-// destroy everything in the address space
+// Destroy everything in the address space. Switches the current thread off it
+// first; fails with ERR_BUSY while another cpu still has it loaded.
 status_t vmm_free_aspace(vmm_aspace_t *aspace)
 __NONNULL((1));
 

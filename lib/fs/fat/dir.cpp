@@ -11,8 +11,10 @@
 #include <ctype.h>
 #include <endian.h>
 #include <lib/bcache/bcache_block_ref.h>
+#include <lk/cpp.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <memory>
 #include <new>
 #include <stdint.h>
@@ -26,16 +28,14 @@
 
 #define LOCAL_TRACE FAT_GLOBAL_TRACE(0)
 
-// structure that represents an open dir handle. holds the offset into the directory
-// that is being walked.
+// An open dir handle: the directory being walked and how far into it we are.
+// The layer holds a reference on the vnode for as long as the handle is open,
+// which is what keeps the fat_vnode below alive.
 struct fat_dir_cookie {
-    fat_dir *dir;
+    fat_vnode *dir;
 
-    struct list_node node;
-
-    // next directory index offset in bytes, 0xffffffff for EOD
+    // next directory offset to read, in bytes from the start of the directory
     uint32_t index;
-    static const uint32_t index_eod = 0xffffffff;
 };
 
 // Convert a UTF-8 path element into UCS-2 code units used by FAT LFN entries.
@@ -168,10 +168,8 @@ status_t fat_ucs2_to_utf8(const uint16_t *ucs2, size_t ucs2_len, char *utf8,
 
 namespace {
 
-status_t fat_find_short_file_in_dir_with_offsets(fat_fs *fat, uint32_t starting_cluster,
-                                                 const char short_name[11], dir_entry *entry,
-                                                 uint32_t *entry_start_offset,
-                                                 uint32_t *entry_end_offset);
+bool fat_short_name_taken(fat_fs *fat, uint32_t starting_cluster, const char short_name[11],
+                          status_t *err_out);
 
 constexpr size_t kFatMaxLfnChars = 255;
 constexpr size_t kFatLfnCharsPerEntry = 13;
@@ -281,14 +279,13 @@ status_t generate_unique_short_name_for_lfn(fat_fs *fat, uint32_t starting_dir_c
     for (uint32_t ord = 1; ord < 1000000; ord++) {
         build_short_name_alias(name, ord, sfn);
 
-        dir_entry existing;
-        status_t err = fat_find_short_file_in_dir_with_offsets(fat, starting_dir_cluster, sfn,
-                                                               &existing, nullptr, nullptr);
-        if (err == ERR_NOT_FOUND) {
+        status_t err;
+        if (!fat_short_name_taken(fat, starting_dir_cluster, sfn, &err)) {
+            if (err < 0) {
+                return err;
+            }
             // this short name is not taken, we can use it
             return NO_ERROR;
-        } else if (err < 0) {
-            return err;
         }
     }
 
@@ -299,13 +296,24 @@ status_t generate_unique_short_name_for_lfn(fat_fs *fat, uint32_t starting_dir_c
 // both dbi and offset will be modified during the call.
 // filles out the entry and returns a pointer into the passed in buffer in out_filename.
 // NOTE: *must* pass at least a MAX_FILE_NAME_LEN byte char pointer in the filename_buffer slot.
+//
+// out_record_start_entries, if passed, receives how many directory entries were
+// stepped over before the start of the record just returned: the first of its long
+// name entries, or the short name entry itself when it stands alone. Counting in
+// entries rather than bytes keeps it independent of where in a sector the walk
+// started; the caller adds it to the absolute offset it began the call at.
 status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &offset, dir_entry *entry,
-                             char filename_buffer[MAX_FILE_NAME_LEN], char **out_filename) {
+                             char filename_buffer[MAX_FILE_NAME_LEN], char **out_filename,
+                             uint32_t *out_record_start_entries = nullptr) {
 
     DEBUG_ASSERT(entry && filename_buffer && out_filename);
 
     // Note: offset is used as an ABSOLUTE directory offset (accounting for sector boundaries)
     // We track which sector we're in based on offset / bytes_per_sector
+
+    // entries stepped over since the call started, which is the unit
+    // out_record_start_entries is reported in
+    uint32_t entries_scanned = 0;
 
     // lfn parsing state: build UTF-8 string backwards from the end of filename_buffer.
     struct lfn_parse_state {
@@ -313,13 +321,22 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
         uint8_t max_sequence = 0;     // highest sequence (the first LFN entry with 0x40)
         uint8_t last_sequence = 0xff; // last sequence seen (for validation)
         uint8_t checksum = 0;
+        uint32_t start_entry = 0; // index of the first LFN entry of the run
+        bool start_valid = false;
 
         void reset() {
             utf8_pos = 0;
             max_sequence = 0;
             last_sequence = 0xff;
+            start_valid = false;
         }
     } lfn_state;
+
+    // step past the entry just examined
+    auto next_entry = [&offset, &entries_scanned]() {
+        offset += DIR_ENTRY_LENGTH;
+        entries_scanned++;
+    };
 
     for (;;) {
         if (LOCAL_TRACE >= 2) {
@@ -338,13 +355,13 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
             } else if (ent[0] == 0xE5) { // deleted entry
                 LTRACEF("deleted entry\n");
                 lfn_state.reset();
-                offset += DIR_ENTRY_LENGTH;
+                next_entry();
                 continue;
             } else if (ent[0x0B] == (uint8_t)fat_attribute::volume_id) {
                 // skip volume ids
                 LTRACEF("skipping volume id\n");
                 lfn_state.reset();
-                offset += DIR_ENTRY_LENGTH;
+                next_entry();
                 continue;
             } else if (ent[0x0B] == (uint8_t)fat_attribute::lfn) {
                 // part of a LFN sequence
@@ -353,7 +370,7 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
                     // malformed LFN sequence, discard any accumulated state
                     LTRACEF("invalid LFN sequence 0\n");
                     lfn_state.reset();
-                    offset += DIR_ENTRY_LENGTH;
+                    next_entry();
                     continue;
                 }
                 // FAT stores LFN entries in reverse: highest sequence (with 0x40 flag)
@@ -366,20 +383,22 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
                     lfn_state.max_sequence = sequence;
                     lfn_state.last_sequence = sequence;
                     lfn_state.checksum = ent[0x0d];
+                    lfn_state.start_entry = entries_scanned;
+                    lfn_state.start_valid = true;
                     LTRACEF_LEVEL(2, "start of new LFN entry, sequence %u\n", sequence);
                 } else {
                     if (lfn_state.last_sequence != sequence + 1) {
                         // our entry is out of sequence? drop it and start over
                         LTRACEF("ent out of sequence %u (last sequence %u)\n", sequence, lfn_state.last_sequence);
                         lfn_state.reset();
-                        offset += DIR_ENTRY_LENGTH;
+                        next_entry();
                         continue;
                     }
                     if (lfn_state.checksum != ent[0x0d]) {
                         // all of the long sequences need to match the checksum
                         LTRACEF("ent mismatches previous checksum\n");
                         lfn_state.reset();
-                        offset += DIR_ENTRY_LENGTH;
+                        next_entry();
                         continue;
                     }
                     lfn_state.last_sequence = sequence;
@@ -410,17 +429,20 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
                 }
 
                 if (lfn_state.max_sequence == 0) {
-                    offset += DIR_ENTRY_LENGTH;
+                    next_entry();
                     continue;
                 }
 
                 // iterate one more entry, since we need to at least need to find the corresponding SFN
-                offset += DIR_ENTRY_LENGTH;
+                next_entry();
                 continue;
             } else {
                 // regular entry, extract the short file name
                 char short_filename[8 + 1 + 3 + 1]; // max short name (8 . 3 NULL)
                 size_t fname_pos = 0;
+
+                // where this entry sits, in case it turns out to be a record of its own
+                const uint32_t sfn_entry = entries_scanned;
 
                 // Ignore trailing spaces in filename and/or extension
                 int fn_len = 8, ext_len = 3;
@@ -453,6 +475,7 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
 
                 // now we have the SFN, see if we just got finished parsing a corresponding LFN
                 // in the previous entries
+                uint32_t record_start_entry = sfn_entry;
                 if (lfn_state.last_sequence == 1) {
                     uint8_t checksum = fat_lfn_sfn_checksum(ent);
                     if (checksum == lfn_state.checksum && lfn_state.utf8_pos < MAX_FILE_NAME_LEN) {
@@ -461,6 +484,11 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
                         memmove(filename_buffer, filename_buffer + lfn_state.utf8_pos, utf8_len);
                         filename_buffer[utf8_len] = '\0';
                         *out_filename = filename_buffer;
+
+                        // the long name entries are part of this file's record
+                        if (lfn_state.start_valid) {
+                            record_start_entry = lfn_state.start_entry;
+                        }
                     } else {
                         LTRACEF("LFN checksum mismatch, using SFN\n");
                         strlcpy(filename_buffer, short_filename, sizeof(short_filename));
@@ -472,8 +500,12 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
                     *out_filename = filename_buffer;
                 }
 
+                if (out_record_start_entries) {
+                    *out_record_start_entries = record_start_entry;
+                }
+
                 lfn_state.reset();
-                offset += DIR_ENTRY_LENGTH;
+                next_entry();
 
                 // fall through, we've found a file entry
             }
@@ -507,7 +539,14 @@ status_t fat_find_next_entry(fat_fs *fat, file_block_iterator &dbi, uint32_t &of
     return ERR_NOT_FOUND;
 }
 
-status_t fat_find_file_in_dir(fat_fs *fat, uint32_t starting_cluster, const char *name, dir_entry *entry, uint32_t *found_offset) {
+// Find a named entry in a directory, reporting the extent of the on-disk record
+// that names it: [entry_start_offset, entry_end_offset) in bytes from the start of
+// the directory. The last entry of that span is the short name entry, which is what
+// a dir_entry_location points at and what fat_dir_update_entry writes to; anything
+// ahead of it is the long name run. Both offsets are optional.
+status_t fat_find_file_in_dir(fat_fs *fat, uint32_t starting_cluster, const char *name,
+                              dir_entry *entry, uint32_t *entry_start_offset,
+                              uint32_t *entry_end_offset) {
     LTRACEF("start_cluster %u, name '%s', out entry %p\n", starting_cluster, name, entry);
 
     DEBUG_ASSERT(fat->lock.is_held());
@@ -528,13 +567,16 @@ status_t fat_find_file_in_dir(fat_fs *fat, uint32_t starting_cluster, const char
     char *filename_buffer = fat->name_scratch();
     for (;;) {
         char *filename;
+        uint32_t record_start_entries;
+        const uint32_t scan_start_offset = dir_offset_base + offset;
 
         // Reset the sector increment count before calling fat_find_next_entry,
         // which may call next_sector one or more times.
         dbi.reset_sector_inc_count();
 
         // step forward one entry and see if we got something
-        err = fat_find_next_entry(fat, dbi, offset, entry, filename_buffer, &filename);
+        err = fat_find_next_entry(fat, dbi, offset, entry, filename_buffer, &filename,
+                                  &record_start_entries);
         if (err < 0) {
             return err;
         }
@@ -547,154 +589,68 @@ status_t fat_find_file_in_dir(fat_fs *fat, uint32_t starting_cluster, const char
 
         // see if we've matched an entry
         if (filenamelen == namelen && !strnicmp(name, filename, filenamelen)) {
-            // we have, return with a good status.
-            // fat_find_next_entry advances offset past the short name entry it
-            // matched, so step back one entry to name the entry itself. This has
-            // to agree with fat_dir_allocate, which hands back the offset of the
-            // short name entry: a dir_entry_location is both the key in the open
-            // file table and the address fat_dir_update_entry writes to.
-            if (found_offset) {
-                const uint32_t entry_end_offset = dir_offset_base + offset;
-                DEBUG_ASSERT(entry_end_offset >= DIR_ENTRY_LENGTH);
-                *found_offset = entry_end_offset - DIR_ENTRY_LENGTH;
-            }
-            return NO_ERROR;
-        }
-    }
-}
-
-status_t fat_find_file_in_dir_with_offsets(fat_fs *fat, uint32_t starting_cluster,
-                                           const char *name, dir_entry *entry,
-                                           uint32_t *entry_start_offset,
-                                           uint32_t *entry_end_offset) {
-    LTRACEF("start_cluster %u, name '%s', out entry %p\n", starting_cluster, name, entry);
-
-    DEBUG_ASSERT(fat->lock.is_held());
-    DEBUG_ASSERT(entry);
-
-    const size_t namelen = strlen(name);
-
-    file_block_iterator dbi(fat, starting_cluster);
-    status_t err = dbi.next_sectors(0);
-    if (err < 0) {
-        return err;
-    }
-
-    uint32_t offset = 0;
-    uint32_t dir_offset_base = 0;
-    char *filename_buffer = fat->name_scratch();
-    for (;;) {
-        char *filename;
-        uint32_t old_offset = dir_offset_base + offset;
-
-        // Reset the sector increment count before calling fat_find_next_entry, which may call next_sector.
-        dbi.reset_sector_inc_count();
-
-        err = fat_find_next_entry(fat, dbi, offset, entry, filename_buffer, &filename);
-        if (err < 0) {
-            return err;
-        }
-
-        // Account for any sector increments that happened in fat_find_next_entry to keep an
-        // absolute offset into the directory.
-        dir_offset_base += dbi.get_sector_inc_count() * fat->info().bytes_per_sector;
-        uint32_t new_offset = dir_offset_base + offset;
-
-        const size_t filenamelen = strlen(filename);
-        if (filenamelen == namelen && !strnicmp(name, filename, filenamelen)) {
-            uint32_t record_start_offset = old_offset;
-
-            // old_offset may include deleted entries that were skipped while walking to
-            // this file record. Pick the first non-deleted/non-volume entry in the span.
-            for (uint32_t probe_offset = old_offset; probe_offset < new_offset;
-                 probe_offset += DIR_ENTRY_LENGTH) {
-                file_block_iterator probe_iter(fat, starting_cluster);
-                status_t probe_err = probe_iter.next_sectors(probe_offset / fat->info().bytes_per_sector);
-                if (probe_err < 0) {
-                    break;
-                }
-
-                const uint8_t *probe_ptr =
-                    probe_iter.get_bcache_ptr(probe_offset % fat->info().bytes_per_sector);
-                if (probe_ptr[0] == 0xE5 || probe_ptr[0] == 0x00 ||
-                    probe_ptr[11] == static_cast<uint8_t>(fat_attribute::volume_id)) {
-                    continue;
-                }
-
-                record_start_offset = probe_offset;
-                break;
-            }
-
+            // fat_find_next_entry leaves offset just past the short name entry it
+            // matched and reports how many entries it stepped over to reach the
+            // start of the record, which may include deleted slots it skipped.
+            const uint32_t end_offset = dir_offset_base + offset;
+            DEBUG_ASSERT(end_offset >= DIR_ENTRY_LENGTH);
             if (entry_start_offset) {
-                *entry_start_offset = record_start_offset;
+                *entry_start_offset = scan_start_offset + record_start_entries * DIR_ENTRY_LENGTH;
+                DEBUG_ASSERT(*entry_start_offset < end_offset);
             }
             if (entry_end_offset) {
-                *entry_end_offset = new_offset;
+                *entry_end_offset = end_offset;
             }
             return NO_ERROR;
         }
     }
 }
 
-status_t fat_find_short_file_in_dir_with_offsets(fat_fs *fat, uint32_t starting_cluster,
-                                                 const char short_name[11], dir_entry *entry,
-                                                 uint32_t *entry_start_offset,
-                                                 uint32_t *entry_end_offset) {
-    LTRACEF("start_cluster %u, short_name '%.11s', out entry %p\n", starting_cluster, short_name,
-            entry);
+// Is this exact 8.3 name already used by an entry in the directory? Matching the
+// raw name bytes rather than a reconstructed name is what makes it usable as the
+// uniqueness test for a generated short name alias.
+bool fat_short_name_taken(fat_fs *fat, uint32_t starting_cluster, const char short_name[11],
+                          status_t *err_out) {
+    LTRACEF("start_cluster %u, short_name '%.11s'\n", starting_cluster, short_name);
 
     DEBUG_ASSERT(fat->lock.is_held());
-    DEBUG_ASSERT(entry);
+    DEBUG_ASSERT(err_out);
+
+    *err_out = NO_ERROR;
 
     file_block_iterator dbi(fat, starting_cluster);
     status_t err = dbi.next_sectors(0);
     if (err < 0) {
-        return err;
+        *err_out = err;
+        return false;
     }
 
-    uint32_t dir_offset = 0;
     uint32_t sector_offset = 0;
     for (;;) {
         while (sector_offset < fat->info().bytes_per_sector) {
             const uint8_t *ent = dbi.get_bcache_ptr(sector_offset);
             if (ent[0] == 0) {
-                return ERR_NOT_FOUND;
+                // end of the directory, so nothing past here is taken either
+                return false;
             }
 
-            if (ent[0] == 0xE5 ||
-                ent[0x0B] == (uint8_t)fat_attribute::volume_id ||
-                ent[0x0B] == (uint8_t)fat_attribute::lfn) {
-                dir_offset += DIR_ENTRY_LENGTH;
-                sector_offset += DIR_ENTRY_LENGTH;
-                continue;
+            if (ent[0] != 0xE5 &&
+                ent[0x0B] != (uint8_t)fat_attribute::volume_id &&
+                ent[0x0B] != (uint8_t)fat_attribute::lfn &&
+                !memcmp(ent, short_name, 11)) {
+                return true;
             }
 
-            if (!memcmp(ent, short_name, 11)) {
-                uint32_t target_cluster = fat_read16(ent, 0x1a);
-                if (fat->info().fat_bits == 32) {
-                    target_cluster |= (uint32_t)fat_read16(ent, 0x14) << 16;
-                    target_cluster &= 0x0fffffff;
-                }
-                entry->length = fat_read32(ent, 0x1c);
-                entry->attributes = (fat_attribute)ent[0x0B];
-                entry->start_cluster = target_cluster;
-
-                if (entry_start_offset) {
-                    *entry_start_offset = dir_offset;
-                }
-                if (entry_end_offset) {
-                    *entry_end_offset = dir_offset + DIR_ENTRY_LENGTH;
-                }
-                return NO_ERROR;
-            }
-
-            dir_offset += DIR_ENTRY_LENGTH;
             sector_offset += DIR_ENTRY_LENGTH;
         }
 
         err = dbi.next_sector();
         if (err < 0) {
-            return err;
+            // running off the end of a fixed size root dir is not an error here
+            if (err != ERR_OUT_OF_RANGE) {
+                *err_out = err;
+            }
+            return false;
         }
         sector_offset = 0;
     }
@@ -734,113 +690,6 @@ static status_t fat_dir_is_empty(fat_fs *fat, uint32_t starting_cluster) {
         }
 
         return ERR_NOT_ALLOWED;
-    }
-}
-
-status_t fat_dir_walk(fat_fs *fat, const char *path, dir_entry *out_entry, dir_entry_location *loc) {
-    LTRACEF("path %s\n", path);
-
-    DEBUG_ASSERT(fat->lock.is_held());
-
-    // routine to push the path element ahead one bump
-    // will leave path pointing at the next element, and path_element_size
-    // in characters for the next element (or 0 if finished).
-    size_t path_element_size = 0;
-    auto path_increment = [&path, &path_element_size]() {
-        path += path_element_size;
-        path_element_size = 0;
-
-        // we're at the end of the string
-        if (*path == 0) {
-            return;
-        }
-
-        // push path past the next /
-        while (*path == '/' && path != 0) {
-            path++;
-        }
-
-        // count the size of the next element
-        const char *ptr = path;
-        while (*ptr != '/' && *ptr != 0) {
-            ptr++;
-            path_element_size++;
-        }
-    };
-
-    // increment it once past leading / and establish an initial path_element_size
-    path_increment();
-    LTRACEF("first path '%s' path_element_size %zu\n", path, path_element_size);
-
-    // set up the starting cluster to search
-    uint32_t dir_start_cluster;
-    if (fat->info().root_cluster) {
-        dir_start_cluster = fat->info().root_cluster;
-    } else {
-        // fat 12/16 has a linear root dir, cluster 0 is a special case to fat_find_file_in_dir below
-        dir_start_cluster = 0;
-    }
-
-    // output entry
-    dir_entry entry{};
-
-    // walk the directory structure
-    char *name_element = fat->element_scratch();
-    for (;;) {
-        strlcpy(name_element, path, MIN(MAX_FILE_NAME_LEN, path_element_size + 1));
-
-        LTRACEF("searching for element %s\n", name_element);
-
-        uint32_t found_offset = 0;
-        auto status = fat_find_file_in_dir(fat, dir_start_cluster, name_element, &entry, &found_offset);
-        if (status < 0) {
-            return ERR_NOT_FOUND;
-        }
-
-        // we found something
-        LTRACEF("found dir entry attributes %#hhx length %u start_cluster %u\n",
-                (uint8_t)entry.attributes, entry.length, entry.start_cluster);
-
-        // push the name element forward one notch so we can see if we're at the end (or iterate once again)
-        path_increment();
-        if (path_element_size > 0) {
-            // did we find a directory on an inner node of the path? we can continue iterating
-            if (entry.attributes == fat_attribute::directory) {
-                dir_start_cluster = entry.start_cluster;
-            } else {
-                LTRACEF("found a non dir at a non terminal path entry, exit\n");
-                return ERR_NOT_FOUND;
-            }
-        } else {
-            // we got a hit at the terminal entry of the path, pass it out to the caller as a success
-            if (out_entry) {
-                *out_entry = entry;
-            }
-            if (loc) {
-                loc->starting_dir_cluster = dir_start_cluster;
-                loc->dir_offset = found_offset;
-            }
-            return NO_ERROR;
-        }
-    }
-}
-
-// splits a path into the part of it leading up to the last element and the last element
-// if the leading part is zero length, return a single "/" element
-// will modify string passed in
-void split_path(char *path, const char **leading_path, const char **last_element) {
-    char *last_slash = strrchr(path, '/');
-    if (last_slash) {
-        *last_slash = 0;
-        if (path[0] != 0) {
-            *leading_path = path;
-        } else {
-            *leading_path = "/";
-        }
-        *last_element = last_slash + 1;
-    } else {
-        *leading_path = "/";
-        *last_element = path;
     }
 }
 
@@ -963,75 +812,6 @@ bcache_block_ref open_dirent_block(fat_fs *fat, const dir_entry_location &loc) {
     return bref;
 }
 
-status_t resolve_parent_cluster_and_last_element(fat_fs *fat, const char *path,
-                                                 char local_path[FS_MAX_FILE_LEN + 1],
-                                                 uint32_t *parent_cluster,
-                                                 const char **last_element) {
-    strlcpy(local_path, path, FS_MAX_FILE_LEN + 1);
-
-    const char *leading_path;
-    split_path(local_path, &leading_path, last_element);
-
-    if (!(*last_element) || (*last_element)[0] == 0) {
-        return ERR_INVALID_ARGS;
-    }
-
-    if (strcmp(leading_path, "/") == 0) {
-        *parent_cluster = fat->info().root_cluster ? fat->info().root_cluster : 0;
-        return NO_ERROR;
-    }
-
-    dir_entry parent_entry;
-    status_t err = fat_dir_walk(fat, leading_path, &parent_entry, nullptr);
-    if (err < 0) {
-        return err;
-    }
-    if (parent_entry.attributes != fat_attribute::directory) {
-        return ERR_BAD_PATH;
-    }
-
-    *parent_cluster = parent_entry.start_cluster;
-    if (*parent_cluster < 2 || *parent_cluster >= fat->info().total_clusters) {
-        return ERR_BAD_STATE;
-    }
-
-    return NO_ERROR;
-}
-
-status_t find_entry_in_parent_for_unlink(fat_fs *fat, uint32_t parent_cluster,
-                                         const char *name, dir_entry *entry,
-                                         uint32_t *entry_start_offset,
-                                         uint32_t *entry_end_offset) {
-    char short_name[8 + 3 + 1];
-    status_t err = name_to_short_file_name(short_name, name);
-    if (err == NO_ERROR) {
-        return fat_find_short_file_in_dir_with_offsets(fat, parent_cluster, short_name, entry,
-                                                       entry_start_offset, entry_end_offset);
-    }
-
-    return fat_find_file_in_dir_with_offsets(fat, parent_cluster, name, entry,
-                                             entry_start_offset, entry_end_offset);
-}
-
-status_t check_entry_not_busy(fat_fs *fat, uint32_t parent_cluster, uint32_t entry_end_offset) {
-    if (entry_end_offset < DIR_ENTRY_LENGTH) {
-        return ERR_BAD_STATE;
-    }
-
-    // Every dir_entry_location names the short name entry, which is the last of
-    // the run, so entry_end_offset is one entry past it.
-    dir_entry_location sfn_loc = {
-        .starting_dir_cluster = parent_cluster,
-        .dir_offset = entry_end_offset - DIR_ENTRY_LENGTH,
-    };
-
-    if (fat->lookup_file(sfn_loc)) {
-        return ERR_BUSY;
-    }
-
-    return NO_ERROR;
-}
-
 status_t mark_entry_record_deleted(fat_fs *fat, uint32_t parent_cluster,
                                    uint32_t entry_start_offset,
                                    uint32_t entry_end_offset) {
@@ -1058,6 +838,15 @@ status_t mark_entry_record_deleted(fat_fs *fat, uint32_t parent_cluster,
 
         uint8_t *ent = (uint8_t *)bref.ptr();
         ent += loc.dir_offset % fat->info().bytes_per_sector;
+
+        // A record is a run of long name entries followed by the short name entry.
+        // Deleting the wrong span would quietly destroy a neighbouring file, so
+        // check the shape of what we are about to mark rather than trusting the
+        // offsets we were handed.
+        const bool last = (offset + DIR_ENTRY_LENGTH == entry_end_offset);
+        DEBUG_ASSERT(ent[0] != 0x00 && ent[0] != 0xE5);
+        DEBUG_ASSERT(last == (ent[0x0B] != (uint8_t)fat_attribute::lfn));
+
         ent[0] = 0xE5;
         bref.mark_dirty();
     }
@@ -1067,49 +856,62 @@ status_t mark_entry_record_deleted(fat_fs *fat, uint32_t parent_cluster,
 
 } // namespace
 
-// static
-status_t fat_dir::mkdir(fscookie *cookie, const char *path) {
-    auto *fat = (fat_fs *)cookie;
+// Mark the record naming an object deleted: the run of long name entries plus the
+// short name entry at loc. Every vnode carries the extent of its own record, so
+// nothing has to scan the directory to find it again.
+status_t fat_dir_remove_entry(fat_fs *fat, const dir_entry_location &loc,
+                              uint32_t record_start_offset) {
+    return mark_entry_record_deleted(fat, loc.starting_dir_cluster, record_start_offset,
+                                     loc.dir_offset + DIR_ENTRY_LENGTH);
+}
+
+status_t fat_lookup(struct fs_vnode *dir, const char *name, struct fs_vnode **out) {
+    fat_vnode *dirv = vnode_of(dir);
+    fat_fs *fat = dirv->fs();
+
+    LTRACEF("dir %p name '%s'\n", dirv, name);
+
+    DEBUG_ASSERT(dirv->is_dir());
+
+    AutoLock guard(fat->lock);
+
+    dir_entry entry = {};
+    uint32_t record_start_offset = 0;
+    uint32_t entry_end_offset = 0;
+    status_t err = fat_find_file_in_dir(fat, dirv->start_cluster(), name, &entry,
+                                        &record_start_offset, &entry_end_offset);
+    if (err < 0) {
+        // a directory that runs out before the name turns up, however it ran out,
+        // is a name that is not there
+        return ERR_NOT_FOUND;
+    }
+
+    const dir_entry_location loc = {
+        .starting_dir_cluster = dirv->start_cluster(),
+        .dir_offset = entry_end_offset - DIR_ENTRY_LENGTH,
+    };
+
+    return fat_vnode_create(fat, entry, loc, record_start_offset, out);
+}
+
+status_t fat_mkdir(struct fs_vnode *dir, const char *name, struct fs_vnode **out) {
+    fat_vnode *dirv = vnode_of(dir);
+    fat_fs *fat = dirv->fs();
+
+    LTRACEF("dir %p name '%s'\n", dirv, name);
+
+    DEBUG_ASSERT(dirv->is_dir());
 
     if (fat->is_read_only()) {
         return ERR_NOT_ALLOWED;
     }
 
-    LTRACEF("cookie %p path '%s'\n", cookie, path);
-
     AutoLock guard(fat->lock);
 
-    char local_path[FS_MAX_FILE_LEN + 1];
-    strlcpy(local_path, path, sizeof(local_path));
+    const uint32_t parent_cluster = dirv->start_cluster();
 
-    const char *leading_path;
-    const char *last_element;
-    split_path(local_path, &leading_path, &last_element);
-
-    if (!last_element || last_element[0] == 0) {
-        return ERR_INVALID_ARGS;
-    }
-
-    uint32_t parent_cluster;
-    uint32_t parent_cluster_for_dotdot;
-    if (strcmp(leading_path, "/") == 0) {
-        parent_cluster = fat->info().root_cluster ? fat->info().root_cluster : 0;
-        parent_cluster_for_dotdot = 0;
-    } else {
-        dir_entry parent_entry;
-        status_t err = fat_dir_walk(fat, leading_path, &parent_entry, nullptr);
-        if (err < 0) {
-            return err;
-        }
-        if (parent_entry.attributes != fat_attribute::directory) {
-            return ERR_BAD_PATH;
-        }
-        parent_cluster = parent_entry.start_cluster;
-        parent_cluster_for_dotdot = parent_cluster;
-        if (parent_cluster < 2 || parent_cluster >= fat->info().total_clusters) {
-            return ERR_BAD_STATE;
-        }
-    }
+    // ".." names the root directory as cluster 0 whatever cluster it starts at
+    const uint32_t parent_cluster_for_dotdot = dirv->is_root() ? 0 : parent_cluster;
 
     uint32_t first_cluster = 0;
     uint32_t last_cluster = 0;
@@ -1118,12 +920,21 @@ status_t fat_dir::mkdir(fscookie *cookie, const char *path) {
         return err;
     }
 
-    dir_entry_location loc;
-    err = fat_dir_allocate(fat, path, fat_attribute::directory, first_cluster, 0, &loc);
+    dir_entry_location loc = {};
+    uint32_t record_start_offset = 0;
+    err = fat_dir_allocate(fat, parent_cluster, name, fat_attribute::directory, first_cluster, 0,
+                           &loc, &record_start_offset);
     if (err != NO_ERROR) {
         fat_free_cluster_chain(fat, first_cluster);
         return err;
     }
+
+    // from here on an error has an entry to undo as well as the cluster. Declared
+    // ahead of the block reference below so it runs after that reference is dropped.
+    auto unwind = lk::make_auto_call([&]() {
+        fat_dir_remove_entry(fat, loc, record_start_offset);
+        fat_free_cluster_chain(fat, first_cluster);
+    });
 
     bcache_block_ref bref(fat->bcache());
     uint32_t sector = fat_sector_for_cluster(fat, first_cluster);
@@ -1153,139 +964,61 @@ status_t fat_dir::mkdir(fscookie *cookie, const char *path) {
 
     bcache_flush(fat->bcache());
 
+    const dir_entry entry = {
+        .attributes = fat_attribute::directory,
+        .length = 0,
+        .start_cluster = first_cluster,
+    };
+    err = fat_vnode_create(fat, entry, loc, record_start_offset, out);
+    if (err < 0) {
+        return err;
+    }
+
+    unwind.cancel();
+
     return NO_ERROR;
 }
 
-// static
-status_t fat_dir::remove(fscookie *cookie, const char *path) {
-    auto *fat = (fat_fs *)cookie;
+// shared by unlink and rmdir. The layer has already resolved and type checked the
+// child and refused if anything still holds it open, so all that is left is to
+// free the clusters and mark the record deleted.
+static status_t remove_entry(struct fs_vnode *dir, struct fs_vnode *child) {
+    fat_vnode *dirv = vnode_of(dir);
+    fat_vnode *childv = vnode_of(child);
+    fat_fs *fat = dirv->fs();
 
     if (fat->is_read_only()) {
         return ERR_NOT_ALLOWED;
     }
 
-    LTRACEF("cookie %p path '%s'\n", cookie, path);
-
     AutoLock guard(fat->lock);
 
-    char local_path[FS_MAX_FILE_LEN + 1];
-    uint32_t parent_cluster;
-    const char *last_element;
-    status_t err = resolve_parent_cluster_and_last_element(fat, path, local_path,
-                                                           &parent_cluster, &last_element);
-    if (err < 0) {
-        return err;
+    const dir_entry_location &loc = childv->loc();
+    DEBUG_ASSERT(loc.starting_dir_cluster == dirv->start_cluster());
+
+    const uint32_t start_cluster = childv->start_cluster();
+
+    if (childv->is_dir()) {
+        status_t err = fat_dir_is_empty(fat, start_cluster);
+        if (err < 0) {
+            return err;
+        }
     }
 
-    dir_entry entry;
-    uint32_t entry_start_offset = 0;
-    uint32_t entry_end_offset = 0;
-    err = find_entry_in_parent_for_unlink(fat, parent_cluster, last_element, &entry,
-                                          &entry_start_offset, &entry_end_offset);
-    if (err < 0) {
-        return err;
-    }
-
-    LTRACEF("found entry: attributes %#hhx length %u start_cluster %u\n",
-            (uint8_t)entry.attributes, entry.length, entry.start_cluster);
-    LTRACEF("entry offsets: start %u end %u\n", entry_start_offset, entry_end_offset);
-
-    if (entry.attributes == fat_attribute::directory) {
-        return ERR_NOT_FILE;
-    }
-
-    err = check_entry_not_busy(fat, parent_cluster, entry_end_offset);
-    if (err < 0) {
-        return err;
-    }
-
-    if (entry.start_cluster != 0) {
-        if (entry.start_cluster < 2 || entry.start_cluster >= fat->info().total_clusters) {
+    if (start_cluster != 0) {
+        if (start_cluster < 2 || start_cluster >= fat->info().total_clusters) {
             return ERR_BAD_STATE;
         }
 
-        err = fat_free_cluster_chain(fat, entry.start_cluster);
+        status_t err = fat_free_cluster_chain(fat, start_cluster);
         if (err != NO_ERROR) {
             return err;
         }
     }
 
-    // Mark all dir entries in this file's record (LFN entries plus SFN entry) as deleted.
-    LTRACEF("Marking entries deleted: start=%u, end=%u\n", entry_start_offset, entry_end_offset);
-    err = mark_entry_record_deleted(fat, parent_cluster, entry_start_offset, entry_end_offset);
+    status_t err = fat_dir_remove_entry(fat, loc, childv->record_start_offset());
     if (err < 0) {
-        LTRACEF("mark_entry_record_deleted failed: %d\n", err);
-        return err;
-    }
-
-    LTRACEF("Flushing bcache...\n");
-    bcache_flush(fat->bcache());
-    LTRACEF("Remove complete\n");
-
-    return NO_ERROR;
-}
-
-// static
-status_t fat_dir::rmdir(fscookie *cookie, const char *path) {
-    auto *fat = (fat_fs *)cookie;
-
-    if (fat->is_read_only()) {
-        return ERR_NOT_ALLOWED;
-    }
-
-    LTRACEF("cookie %p path '%s'\n", cookie, path);
-
-    AutoLock guard(fat->lock);
-
-    char local_path[FS_MAX_FILE_LEN + 1];
-    uint32_t parent_cluster;
-    const char *last_element;
-    status_t err = resolve_parent_cluster_and_last_element(fat, path, local_path,
-                                                           &parent_cluster, &last_element);
-    if (err < 0) {
-        return err;
-    }
-
-    dir_entry entry;
-    uint32_t entry_start_offset = 0;
-    uint32_t entry_end_offset = 0;
-    err = find_entry_in_parent_for_unlink(fat, parent_cluster, last_element, &entry,
-                                          &entry_start_offset, &entry_end_offset);
-    if (err < 0) {
-        return err;
-    }
-
-    LTRACEF("found entry: attributes %#hhx length %u start_cluster %u\n",
-            (uint8_t)entry.attributes, entry.length, entry.start_cluster);
-    LTRACEF("entry offsets: start %u end %u\n", entry_start_offset, entry_end_offset);
-
-    if (entry.attributes != fat_attribute::directory) {
-        return ERR_NOT_DIR;
-    }
-
-    if (entry.start_cluster < 2 || entry.start_cluster >= fat->info().total_clusters) {
-        return ERR_BAD_STATE;
-    }
-
-    err = check_entry_not_busy(fat, parent_cluster, entry_end_offset);
-    if (err < 0) {
-        return err;
-    }
-
-    err = fat_dir_is_empty(fat, entry.start_cluster);
-    if (err < 0) {
-        return err;
-    }
-
-    err = fat_free_cluster_chain(fat, entry.start_cluster);
-    if (err != NO_ERROR) {
-        return err;
-    }
-
-    // Mark all dir entries in this directory record (LFN entries plus SFN entry) as deleted.
-    LTRACEF("Marking entries deleted: start=%u, end=%u\n", entry_start_offset, entry_end_offset);
-    err = mark_entry_record_deleted(fat, parent_cluster, entry_start_offset, entry_end_offset);
-    if (err < 0) {
+        LTRACEF("fat_dir_remove_entry failed: %d\n", err);
         return err;
     }
 
@@ -1294,8 +1027,21 @@ status_t fat_dir::rmdir(fscookie *cookie, const char *path) {
     return NO_ERROR;
 }
 
-status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute attr, const uint32_t starting_cluster, const uint32_t size, dir_entry_location *loc) {
-    LTRACEF("path %s\n", path);
+status_t fat_unlink(struct fs_vnode *dir, const char *name, struct fs_vnode *child) {
+    LTRACEF("dir %p name '%s'\n", vnode_of(dir), name);
+    return remove_entry(dir, child);
+}
+
+status_t fat_rmdir(struct fs_vnode *dir, const char *name, struct fs_vnode *child) {
+    LTRACEF("dir %p name '%s'\n", vnode_of(dir), name);
+    return remove_entry(dir, child);
+}
+
+status_t fat_dir_allocate(fat_fs *fat, const uint32_t parent_cluster, const char *name,
+                          const fat_attribute attr, const uint32_t starting_cluster,
+                          const uint32_t size, dir_entry_location *loc,
+                          uint32_t *record_start_offset) {
+    LTRACEF("parent cluster %u, name '%s'\n", parent_cluster, name);
 
     if (fat->is_read_only()) {
         return ERR_NOT_ALLOWED;
@@ -1303,57 +1049,13 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
 
     DEBUG_ASSERT(fat->lock.is_held());
 
-    // trim the last segment off the path, splitting into stuff leading up to the last segment and the last segment
-    char local_path[FS_MAX_FILE_LEN + 1];
-    strlcpy(local_path, path, FS_MAX_FILE_LEN);
-
-    const char *leading_path;
-    const char *last_element;
-    split_path(local_path, &leading_path, &last_element);
-
-    DEBUG_ASSERT(leading_path && last_element);
-
-    LTRACEF("path is now split into %s and %s\n", leading_path, last_element);
-
-    // find the starting directory cluster of the container directory
-    // 0 may mean root dir on fat12/16
-    uint32_t starting_dir_cluster;
-    if (strcmp(leading_path, "/") == 0) {
-        // root dir is a special case since we know where to start
-        if (fat->info().root_cluster) {
-            starting_dir_cluster = fat->info().root_cluster;
-        } else {
-            // fat 12/16 has a linear root dir, cluster 0 is a special case to fat_find_file_in_dir below
-            starting_dir_cluster = 0;
-        }
-    } else {
-        // walk to find the containing directory
-        dir_entry entry;
-        dir_entry_location dir_loc;
-        status_t err = fat_dir_walk(fat, local_path, &entry, &dir_loc);
-        if (err < 0) {
-            return err;
-        }
-
-        // verify it's a directory
-        if (entry.attributes != fat_attribute::directory) {
-            return ERR_BAD_PATH;
-        }
-
-        LTRACEF("found containing dir at %u:%u: starting cluster %u\n", dir_loc.starting_dir_cluster, dir_loc.dir_offset, entry.start_cluster);
-
-        starting_dir_cluster = entry.start_cluster;
-        if (starting_dir_cluster < 2 || starting_dir_cluster >= fat->info().total_clusters) {
-            TRACEF("directory entry contains out of bounds cluster %u\n", starting_dir_cluster);
-            return ERR_BAD_STATE;
-        }
-    }
-
-    LTRACEF("starting dir cluster of parent dir %u\n", starting_dir_cluster);
+    // cluster 0 is the magic value for the fixed root dir on fat 12/16
+    LTRACEF("starting dir cluster of parent dir %u\n", parent_cluster);
 
     // verify the file doesn't already exist
     dir_entry entry;
-    status_t err = fat_find_file_in_dir(fat, starting_dir_cluster, last_element, &entry, nullptr);
+    status_t err = fat_find_file_in_dir(fat, parent_cluster, name, &entry, nullptr,
+                                        nullptr);
     if (err >= 0) {
         // we found it, cant create a new file in its place
         return ERR_ALREADY_EXISTS;
@@ -1364,14 +1066,14 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
     size_t lfn_ucs2_len = 0;
     bool needs_lfn = false;
 
-    err = name_to_short_file_name(sfn, last_element);
+    err = name_to_short_file_name(sfn, name);
     if (err < 0) {
         lfn_ucs2.reset(new (std::nothrow) uint16_t[kFatMaxLfnChars]);
         if (!lfn_ucs2) {
             return ERR_NO_MEMORY;
         }
 
-        status_t lfn_err = fat_utf8_to_ucs2(last_element, lfn_ucs2.get(), kFatMaxLfnChars, &lfn_ucs2_len);
+        status_t lfn_err = fat_utf8_to_ucs2(name, lfn_ucs2.get(), kFatMaxLfnChars, &lfn_ucs2_len);
         if (lfn_err < 0) {
             return lfn_err;
         }
@@ -1380,7 +1082,7 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
             return ERR_INVALID_ARGS;
         }
 
-        err = generate_unique_short_name_for_lfn(fat, starting_dir_cluster, last_element, sfn);
+        err = generate_unique_short_name_for_lfn(fat, parent_cluster, name, sfn);
         if (err < 0) {
             return err;
         }
@@ -1399,7 +1101,7 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
     bool found_run = false;
 
     for (;;) {
-        file_block_iterator dbi(fat, starting_dir_cluster);
+        file_block_iterator dbi(fat, parent_cluster);
         err = dbi.next_sectors(0);
         if (err < 0) {
             return err;
@@ -1456,12 +1158,12 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
         }
 
         // Need more room.
-        if (starting_dir_cluster == 0) {
+        if (parent_cluster == 0) {
             // Root directory on FAT12/16 is fixed size and cannot grow.
             return ERR_NO_MEMORY;
         }
 
-        uint32_t last_cluster = fat_find_last_cluster_in_chain(fat, starting_dir_cluster);
+        uint32_t last_cluster = fat_find_last_cluster_in_chain(fat, parent_cluster);
         uint32_t new_cluster;
         uint32_t last_allocated;
         err = fat_allocate_cluster_chain(fat, last_cluster, 1, &new_cluster, &last_allocated, true);
@@ -1473,7 +1175,7 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
     uint8_t checksum = fat_lfn_sfn_checksum(reinterpret_cast<const uint8_t *>(sfn));
     for (size_t i = 0; i < total_entry_count; i++) {
         dir_entry_location entry_loc = {
-            .starting_dir_cluster = starting_dir_cluster,
+            .starting_dir_cluster = parent_cluster,
             .dir_offset = run_start_offset + static_cast<uint32_t>(i * DIR_ENTRY_LENGTH),
         };
         bcache_block_ref bref = open_dirent_block(fat, entry_loc);
@@ -1498,8 +1200,13 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
     bcache_flush(fat->bcache());
 
     if (loc) {
-        loc->starting_dir_cluster = starting_dir_cluster;
+        loc->starting_dir_cluster = parent_cluster;
         loc->dir_offset = run_start_offset + static_cast<uint32_t>(lfn_entry_count * DIR_ENTRY_LENGTH);
+    }
+    if (record_start_offset) {
+        // the record starts at the first long name entry, or at the short name
+        // entry itself when there are none
+        *record_start_offset = run_start_offset;
     }
 
     return NO_ERROR;
@@ -1529,93 +1236,34 @@ status_t fat_dir_update_entry(fat_fs *fat, const dir_entry_location &loc, uint32
     return NO_ERROR;
 }
 
-status_t fat_dir::opendir_priv(const dir_entry &entry, const dir_entry_location &loc, fat_dir_cookie **out_cookie) {
-    // fill in our file info based on the entry
-    start_cluster_ = entry.start_cluster;
-    length_ = 0; // dirs all have 0 length entry
-    dir_loc_ = loc;
-    inc_ref();
+status_t fat_opendir(struct fs_vnode *vn, dircookie **dcookie) {
+    fat_vnode *dirv = vnode_of(vn);
 
-    // create a dir cookie
-    auto dir_cookie = new fat_dir_cookie;
-    dir_cookie->dir = this;
-    dir_cookie->index = 0;
+    LTRACEF("vnode %p dircookie %p\n", dirv, dcookie);
 
-    // add it to the dir object
-    list_add_tail(&cookies_, &dir_cookie->node);
+    if (!dirv->is_dir()) {
+        return ERR_NOT_DIR;
+    }
 
-    *out_cookie = dir_cookie;
+    auto *cookie = new (std::nothrow) fat_dir_cookie;
+    if (!cookie) {
+        return ERR_NO_MEMORY;
+    }
+
+    // the layer holds a reference on the vnode for as long as this handle lives
+    cookie->dir = dirv;
+    cookie->index = 0;
+
+    *dcookie = (dircookie *)cookie;
 
     return NO_ERROR;
 }
 
-status_t fat_dir::opendir(fscookie *cookie, const char *name, dircookie **dcookie) {
-    auto fat = (fat_fs *)cookie;
+status_t fat_readdir(dircookie *dcookie, struct dirent *ent) {
+    auto *cookie = (fat_dir_cookie *)dcookie;
+    fat_vnode *dirv = cookie->dir;
+    fat_fs *fat = dirv->fs();
 
-    LTRACEF("cookie %p name '%s' dircookie %p\n", cookie, name, dcookie);
-
-    AutoLock guard(fat->lock);
-
-    dir_entry entry;
-    dir_entry_location loc;
-
-    // special case for /
-    if (name[0] == 0 || !strcmp(name, "/")) {
-        entry.attributes = fat_attribute::directory;
-        entry.length = 0;
-        if (fat->info().fat_bits == 32) {
-            entry.start_cluster = fat->info().root_cluster;
-        } else {
-            entry.start_cluster = 0;
-        }
-
-        // special case for the root dir
-        // 0:0 is not sufficient, since we could actually find a file in the root dir
-        // on a fat 12/16 volume (magic cluster 0) at offset 0. cluster 1 is never used
-        // so mark root dir as 1:0
-        loc.starting_dir_cluster = 1;
-        loc.dir_offset = 0;
-    } else {
-        status_t err = fat_dir_walk(fat, name, &entry, &loc);
-        if (err != NO_ERROR) {
-            return err;
-        }
-    }
-
-    // if we walked and found a proper directory, it's a hit
-    if (entry.attributes == fat_attribute::directory) {
-        fat_dir *dir;
-
-        // see if this dir is already present in the fs list
-        fat_file *file = fat->lookup_file(loc);
-        if (file) {
-            // XXX replace with hand rolled RTTI
-            dir = reinterpret_cast<fat_dir *>(file);
-        } else {
-            dir = new fat_dir(fat);
-        }
-        DEBUG_ASSERT(dir);
-
-        fat_dir_cookie *dir_cookie;
-
-        status_t err = dir->opendir_priv(entry, loc, &dir_cookie);
-        if (err < 0) {
-            // weird state, should we dec the ref?
-            PANIC_UNIMPLEMENTED;
-            return err;
-        }
-        DEBUG_ASSERT(dir_cookie);
-
-        *dcookie = (dircookie *)dir_cookie;
-        return NO_ERROR;
-    } else {
-        return ERR_NOT_FILE;
-    }
-
-    return ERR_NOT_IMPLEMENTED;
-};
-
-status_t fat_dir::readdir_priv(fat_dir_cookie *cookie, struct dirent *ent) {
     LTRACEF("dircookie %p ent %p, current index %u\n", cookie, ent, cookie->index);
 
     if (!ent) {
@@ -1625,21 +1273,20 @@ status_t fat_dir::readdir_priv(fat_dir_cookie *cookie, struct dirent *ent) {
     // make sure the cookie makes sense
     DEBUG_ASSERT((cookie->index % DIR_ENTRY_LENGTH) == 0);
 
-    dir_entry entry;
+    AutoLock guard(fat->lock);
 
-    {
-        AutoLock guard(fs_->lock);
-
-        char *filename_buffer = fs_->name_scratch();
+    for (;;) {
+        dir_entry entry;
+        char *filename_buffer = fat->name_scratch();
         char *filename;
 
         // kick start our directory sector iterator
-        LTRACEF("start cluster %u\n", start_cluster_);
-        file_block_iterator dbi(fs_, start_cluster_);
+        LTRACEF("start cluster %u\n", dirv->start_cluster());
+        file_block_iterator dbi(fat, dirv->start_cluster());
 
         // move it forward to our index point
         // also loads the buffer
-        status_t err = dbi.next_sectors(cookie->index / fs_->info().bytes_per_sector);
+        status_t err = dbi.next_sectors(cookie->index / fat->info().bytes_per_sector);
         if (err < 0) {
             return err;
         }
@@ -1648,69 +1295,40 @@ status_t fat_dir::readdir_priv(fat_dir_cookie *cookie, struct dirent *ent) {
         dbi.reset_sector_inc_count();
 
         // pass the index in units of sector offset
-        uint32_t offset = cookie->index % fs_->info().bytes_per_sector;
-        err = fat_find_next_entry(fs_, dbi, offset, &entry, filename_buffer, &filename);
+        uint32_t offset = cookie->index % fat->info().bytes_per_sector;
+        err = fat_find_next_entry(fat, dbi, offset, &entry, filename_buffer, &filename);
         if (err < 0) {
             return err;
         }
 
         // bump the index forward by extracting how much the sector iterator pushed things forward
-        uint32_t index_inc = offset - (cookie->index % fs_->info().bytes_per_sector);
-        index_inc += dbi.get_sector_inc_count() * fs_->info().bytes_per_sector;
+        uint32_t index_inc = offset - (cookie->index % fat->info().bytes_per_sector);
+        index_inc += dbi.get_sector_inc_count() * fat->info().bytes_per_sector;
         LTRACEF("calculated index increment %u (old index %u, offset %u, sector_inc_count %u)\n",
                 index_inc, cookie->index, offset, dbi.get_sector_inc_count());
         cookie->index += index_inc;
 
+        // "." and ".." are how a FAT subdirectory records its own and its parent's
+        // starting cluster on disk. The layer flattens both lexically and no
+        // filesystem in the tree reports them, so they are not part of a listing.
+        if (!strcmp(filename, ".") || !strcmp(filename, "..")) {
+            continue;
+        }
+
         // copy the info into the fs layer's entry while the lock still guards the
         // scratch buffer filename points into
         strlcpy(ent->name, filename, MIN(sizeof(ent->name), MAX_FILE_NAME_LEN));
+
+        return NO_ERROR;
     }
-
-    return NO_ERROR;
 }
 
-status_t fat_dir::readdir(dircookie *dcookie, struct dirent *ent) {
-    auto cookie = (fat_dir_cookie *)dcookie;
-    auto dir = cookie->dir;
+status_t fat_closedir(dircookie *dcookie) {
+    auto *cookie = (fat_dir_cookie *)dcookie;
 
-    return dir->readdir_priv(cookie, ent);
-}
-
-status_t fat_dir::closedir_priv(fat_dir_cookie *cookie, bool *last_ref) {
     LTRACEF("dircookie %p\n", cookie);
 
-    AutoLock guard(fs_->lock);
-
-    // remove the dircookie from the list
-    DEBUG_ASSERT(list_in_list(&cookie->node));
-    list_delete(&cookie->node);
-
-    // delete it
     delete cookie;
-
-    // drop a ref to the dir
-    *last_ref = dec_ref();
-    if (*last_ref) {
-        DEBUG_ASSERT(list_is_empty(&cookies_));
-    }
-
-    return NO_ERROR;
-}
-
-status_t fat_dir::closedir(dircookie *dcookie) {
-    auto cookie = (fat_dir_cookie *)dcookie;
-    auto dir = cookie->dir;
-
-    bool last_ref;
-    status_t err = dir->closedir_priv(cookie, &last_ref);
-    if (err < 0) {
-        return err;
-    }
-
-    if (last_ref) {
-        LTRACEF("last ref, deleting %p (%u:%u)\n", dir, dir->dir_loc().starting_dir_cluster, dir->dir_loc().dir_offset);
-        delete dir;
-    }
 
     return NO_ERROR;
 }

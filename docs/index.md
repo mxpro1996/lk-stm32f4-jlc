@@ -11,7 +11,9 @@ Welcome to the LK (Little Kernel) documentation. LK is a small operating system 
 ### Core Kernel Documentation
 - [Threading and Scheduler System](threading_and_scheduler.md) - Comprehensive guide to LK's preemptive multithreading system
 - [Blocking Primitives](blocking_primitives.md) - Synchronization primitives (mutexes, semaphores, events, ports, spinlocks)
+- [Intrusive Lists](list.md) - The lk/list.h doubly linked list and its C++ wrapper
 - [VMM Overview](vmm_overview.md) - Virtual Memory Management system architecture and implementation
+- [Filesystem Layer](fs.md) - The mount namespace, the vnode interface, and how to write a filesystem
 - [Source Tree Structure](source_tree_structure.md) - Organization and structure of the LK source code repository
 
 ### Platform-Specific Documentation
@@ -21,6 +23,7 @@ Welcome to the LK (Little Kernel) documentation. LK is a small operating system 
 - [FVP Base - Internal Overview](fvp-base/internal.md) - Boot sequence, memory layout, and peripheral details
 
 ### Development and Testing
+- [Booting via UEFI (x86-64)](uefi_boot.md) - The in-kernel EFI stub and testing with QEMU + OVMF
 - [Network Setup for QEMU](lk_tap.md) - Setting up tun/tap networking for QEMU testing
 - [GDB Debug Support for GBL](gdb_debug_support_for_gbl.md) - Debugging GBL using GDB with UEFI debug support protocol
 
@@ -41,7 +44,6 @@ LK is designed as a modular kernel with the following key components:
 - x86/x86_64
 - Motorola 68000
 - MIPS
-- OpenRISC 1000
 - VAX (experimental)
 
 ## Supported Platforms

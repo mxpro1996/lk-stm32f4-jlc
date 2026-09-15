@@ -207,6 +207,7 @@ int load_sections_and_execute(ImageReader *reader,
     printf("efi_initialize_system_table_pointer failed: %lu\n", status);
     return -static_cast<int>(status);
   }
+  DEFER { efi_uninitialize_system_table_pointer(); };
   char path[FS_MAX_PATH_LEN];
   reader->get_name(path, sizeof(path));
   path[sizeof(path) - 1] = '\0';

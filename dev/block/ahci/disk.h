@@ -8,7 +8,7 @@
 
 #include <lib/bio.h>
 #include <lk/cpp.h>
-#include <lk/list.h>
+#include <lktl/list.h>
 #include <sys/types.h>
 #include <type_traits>
 
@@ -23,7 +23,7 @@ struct async_io_op {
     ssize_t result; // set by completion handler
 };
 
-class ahci_disk final {
+class ahci_disk final : public lk::list_hook<> {
   public:
     explicit ahci_disk(ahci_port &p) : port_(p) {}
     ~ahci_disk();
@@ -90,10 +90,6 @@ class ahci_disk final {
 
     static_assert(std::is_standard_layout<bio_handler>::value, "");
     static_assert(offsetof(bio_handler, bdev_) == 0, "");
-
-    // Must be visible to the ahci class for disk list management
-    list_node node_ = LIST_INITIAL_CLEARED_VALUE;
-    friend class ahci;
 
     // drive parameters
     uint32_t logical_sector_size_ = 512;

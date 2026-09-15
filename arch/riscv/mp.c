@@ -96,7 +96,9 @@ enum handler_return riscv_software_exception(void) {
         reason &= ~(1u << MP_IPI_RESCHEDULE);
     }
     if (reason & (1u << MP_IPI_GENERIC)) {
-        panic("unimplemented MP_IPI_GENERIC\n");
+        if (mp_mbx_generic_irq() == INT_RESCHEDULE) {
+            ret = INT_RESCHEDULE;
+        }
         reason &= ~(1u << MP_IPI_GENERIC);
     }
 

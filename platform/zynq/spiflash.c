@@ -453,7 +453,7 @@ usage:
 
         uint8_t *buf = calloc(1, 512);
         ssize_t len = spiflash_read_cfi(buf, 512);
-        printf("returned cfi len %ld\n", len);
+        printf("returned cfi len %zd\n", len);
 
         hexdump8(buf, len);
 
@@ -466,7 +466,7 @@ usage:
 
         uint8_t *buf = calloc(1, 1024);
         ssize_t len = spiflash_read_otp(buf, 0, 1024);
-        printf("spiflash_read_otp returns %ld\n", len);
+        printf("spiflash_read_otp returns %zd\n", len);
 
         hexdump8(buf, len);
 

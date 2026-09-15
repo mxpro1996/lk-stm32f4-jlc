@@ -256,6 +256,13 @@ status_t virtio_block_init(virtio_device *dev) {
                              VIRTIO_BLK_F_CONFIG_WCE);
     dev->bus()->virtio_set_guest_features(0, bdev->guest_features);
 
+    /* confirm the feature set before touching the config space or the queue */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-block: device rejected feature negotiation\n");
+        return err;
+    }
+
     // If supported, prefer writeback mode for better throughput.
     if (bdev->guest_features & VIRTIO_BLK_F_CONFIG_WCE) {
         dev->config_write8(offsetof(virtio_blk_config, writeback), 1);
@@ -386,7 +393,7 @@ enum handler_return virtio_block_irq_driver_callback(virtio_device *dev, uint ri
         // async
         ssize_t result =
             (txn->status == VIRTIO_BLK_S_OK) ? (ssize_t)txn->len : ERR_IO;
-        LTRACEF("calling callback %p with cookie %p, len %ld\n", txn->callback,
+        LTRACEF("calling callback %p with cookie %p, len %zd\n", txn->callback,
                 txn->cookie, result);
         txn->callback(txn->cookie, &bdev->bdev, result);
     }

@@ -44,7 +44,14 @@ enum handler_return {
     INT_RESCHEDULE,
 };
 
-typedef signed long int ssize_t;
+/* ssize_t has to be the signed counterpart of size_t so that %zd prints it
+ * without a format warning. The underlying type varies between toolchains at
+ * the same word size (__SIZE_TYPE__ is unsigned int on arm, riscv32, or1k and
+ * microblaze but long unsigned int on i386 and m68k), so take it from the
+ * compiler rather than hard coding it. __PTRDIFF_TYPE__ is that signed
+ * counterpart on every target LK builds for.
+ */
+typedef __PTRDIFF_TYPE__ ssize_t;
 
 typedef uint8_t u8;
 typedef uint16_t u16;

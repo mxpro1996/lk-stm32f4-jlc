@@ -58,6 +58,7 @@ struct EfiDebugImageInfoTableHeader {
 };
 
 EfiStatus efi_initialize_system_table_pointer(struct EfiSystemTable *system_table);
+void efi_uninitialize_system_table_pointer();
 EfiStatus efi_core_new_debug_image_info_entry(uint32_t image_info_type,
                                               EfiLoadedImageProtocol *loaded_image,
                                               EfiHandle image_handle);

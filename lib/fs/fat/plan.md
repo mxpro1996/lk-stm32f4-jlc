@@ -5,7 +5,6 @@ This file tracks the remaining tasks and improvements for the FAT filesystem imp
 ## Functional Gaps
 
 - **Timestamps** (`fat_priv.h`, `dir.cpp`): Implement proper creation, access, and modification time handling. Currently, these are written as zero and ignored during `stat`.
-- **Unmount Active File Check** (`fs.cpp`): Ensure `fs_unmount` handles open files or directories correctly (either rejecting unmount or ensuring all buffers are flushed). Today it `DEBUG_ASSERT`s the open file list is empty, so a leaked handle in a test takes down every later mount.
 - **Attribute Validation** (`file.cpp`): Tighten `open_file_priv` to reject entries with `volume_id` or other special attributes that shouldn't be opened as regular files.
 - **Non-zero length file creation** (`file.cpp`): `create_file` returns `ERR_NOT_IMPLEMENTED` for any non-zero initial length, so `mkfile <path> <len>` from the shell does not work.
 
@@ -20,11 +19,11 @@ This file tracks the remaining tasks and improvements for the FAT filesystem imp
 ## Testing & Validation
 
 - **Edge Case Tests** still wanted:
-  - mkdir/remove in non-root directories on FAT12/16 and FAT32.
   - Invalid name handling: reserved DOS names, trailing dots and spaces, characters
     illegal in a short name, paths at and beyond `FS_MAX_PATH_LEN`/`FS_MAX_FILE_LEN`.
   - Verification of `.` and `..` *content* (the cluster numbers they point at) via
-    direct directory reads, rather than just their presence in a listing.
+    direct directory reads. A listing no longer shows them at all, so this is now
+    the only way to check them.
   - Concurrency: several threads on one mount, and deliberate contention on a
     single file against the refcounted open file table.
 
@@ -47,6 +46,15 @@ verifier; keep it in step with `WITNESS_FILES` in `run-fat-tests.py`.
 
 ## Recently Completed
 
+- Converted to the fs layer's vnode interface (`lib/fs/plan.md` Phase 5): one
+  `fat_vnode` type replaces `fat_file`/`fat_dir`, the layer owns object lifetime
+  and identity, and `fat_dir_walk`, `split_path`, the three parent-resolve copies
+  and the open file table are gone. Each vnode caches the extent of its own
+  directory record, so unlink no longer rescans the parent. Non-root
+  mkdir/remove and the FAT12/16 root-first-entry identity case are covered by
+  new `ram_tests.cpp` cases.
+- `fs_unmount` with files or directories still open: the layer refuses it, so
+  the driver no longer has an open file list to assert on.
 - Mount-time device size validation, plus a check that the metadata fits inside
   `total_sectors` (`fs.cpp`).
 - FAT type selection compared `total_clusters` (= data clusters + 2) against the

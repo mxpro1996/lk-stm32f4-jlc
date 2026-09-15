@@ -43,6 +43,12 @@ MODULE_SRCS += \
 
 ARM64_PAGE_SIZE ?= 4096
 
+# Set to 1 to run user address spaces on one shared ASID with a flush per switch,
+# the way an 8 bit ASID cpu is handled, even when the cpu implements 16 bits.
+# Only useful for testing that path; qemu always reports 16 bits.
+ARM64_ASID_FALLBACK ?= 0
+GLOBAL_DEFINES += ARM64_ASID_FALLBACK=$(ARM64_ASID_FALLBACK)
+
 # platform/target/project is allowed to override the page size the kernel
 # and user space will run at.
 ifeq ($(ARM64_PAGE_SIZE), 4096)
@@ -135,5 +141,7 @@ linkerscript.phony:
 .PHONY: linkerscript.phony
 
 MODULE_OPTIONS := extra_warnings
+
+MODULE_WEAK_DEPS += dev/interrupt/arm_gic
 
 include make/module.mk

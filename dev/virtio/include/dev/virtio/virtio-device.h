@@ -25,6 +25,7 @@ public:
     }
 
     /* api used by devices to interact with the virtio bus */
+    /* len must be a power of two no larger than bus()->virtio_queue_max_size(index) */
     status_t virtio_alloc_ring(uint index, uint16_t len);
 
     /* add a descriptor at index desc_index to the free list on ring_index */

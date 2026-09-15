@@ -16,8 +16,15 @@ ifndef LKROOT
 $(error please define LKROOT to the root of the lk build system)
 endif
 
-# any local environment overrides can optionally be placed in local.mk
+# any local environment overrides can optionally be placed in local.mk.
+# Set IGNORE_LOCAL_MK=1 to skip it, so that a build depends only on the
+# arguments it was given. Useful when reproducing a CI result or bisecting a
+# build break, where a silently included local.mk is easy to overlook. Note
+# local.mk is also where a toolchain prefix may be set, so a build that relies
+# on one will need it passed explicitly instead.
+ifneq ($(IGNORE_LOCAL_MK),1)
 -include local.mk
+endif
 
 # If one of our goals (from the commandline) happens to have a
 # matching project/goal.mk, then we should re-invoke make with
@@ -137,6 +144,10 @@ GENERATED := $(CONFIGHEADER)
 # anything added to GLOBAL_DEFINES will be put into $(BUILDDIR)/config.h
 GLOBAL_DEFINES := LK=1
 
+# Always defined, so code can test it with a bare #if UBSAN. Instrumentation
+# inflates stack frames noticeably, which the tighter embedded configs care about.
+GLOBAL_DEFINES += UBSAN=$(if $(filter 1,$(UBSAN)),1,0)
+
 # Anything added to GLOBAL_SRCDEPS will become a dependency of every source file in the system.
 # Useful for header files that may be included by one or more source files.
 GLOBAL_SRCDEPS := $(CONFIGHEADER)
@@ -182,6 +193,10 @@ DENY_MODULES :=
 # Build modules with unit tests enabled
 WITH_TESTS ?= false
 
+# Set to 1 by platform/target rules.mk for targets with RAM well under ~1MB, so
+# memory-hungry code (tests, etc) can size itself down or compile itself out.
+LK_EMBEDDED ?= 0
+
 # try to include the project file
 -include project/$(PROJECT).mk
 ifndef TARGET
@@ -198,8 +213,11 @@ $(error couldn't find arch or platform doesn't define arch)
 endif
 
 # list the architecture specified in the project/target/platform rules.mk and early terminate.
+# SUBARCH is only meaningful for some arches (riscv's 32/64, arm's arm/arm-m) and may be
+# empty; the arch rules.mk has not been included yet so arch level defaults do not apply.
 ifeq ($(MAKECMDGOALS), list-arch)
 $(info ARCH = $(ARCH))
+$(info SUBARCH = $(SUBARCH))
 .PHONY: list-arch
 list-arch:
 else
@@ -272,10 +290,16 @@ else
     STRIP ?= $(TOOLCHAIN_PREFIX)strip
 endif
 
-# Detect whether we are using ld.lld. If we don't detect ld.lld, we assume
-# it's ld.bfd. This check can be refined in the future if we need to handle
-# more cases (e.g. ld.gold).
-LINKER_TYPE := $(shell $(LD) -v 2>&1 | grep -q "LLD" && echo lld || echo bfd)
+# Detect whether we are using ld.lld, assuming it is named ld.lld. If we don't
+# detect ld.lld, we assume it's ld.bfd. This check can be refined in the future
+# if we need to handle more cases (e.g. ld.gold).
+#
+# Match on the name rather than the version banner. An 'ld' that is really lld
+# reports "LLD" and would be taken for a usable cross linker even when it is
+# the Mach-O only flavor, as on macOS, enabling flags and code paths that then
+# fail confusingly. LLD is only wanted here when it has been asked for by name
+# (LD=ld.lld), so that is what we look for.
+LINKER_TYPE := $(if $(filter %ld.lld,$(notdir $(firstword $(LD)))),lld,bfd)
 $(info LINKER_TYPE=$(LINKER_TYPE))
 # Detect whether we are compiling with GCC or Clang
 COMPILER_TYPE := $(shell $(CC) -v 2>&1 | grep -q "clang version" && echo clang || echo gcc)
@@ -318,15 +342,11 @@ endif
 ifeq ($(call is_warning_flag_supported,-Wnonnull-compare),yes)
 GLOBAL_COMPILEFLAGS += -Wno-nonnull-compare
 endif
-# Ideally we would move this check to arm64/rules.mk, but we can only check
-# for supported warning flags once CC is defined.
-ifeq ($(ARCH),arm64)
-# Clang incorrectly diagnoses msr operations as need a 64-bit operand even if
-# the underlying register is actually 32 bits. Silence this common warning.
-ifeq ($(call is_warning_flag_supported,-Wasm-operand-widths),yes)
-ARCH_COMPILEFLAGS += -Wno-asm-operand-widths
-endif
-endif
+# Note: -Wno-asm-operand-widths used to be added for arm64 here, on the premise
+# that clang was wrong to want a 64-bit operand for msr. It is not wrong: MSR/MRS
+# transfer all 64 bits and only accept an X register, so a 32-bit operand emits
+# an x register whose upper half was never zeroed. ARM64_WRITE_SYSREG casts to
+# uint64_t instead, which fixes the cause rather than hiding it.
 
 ifeq ($(ARCH),riscv)
 # ld.lld does not support linker relaxations yet.
@@ -372,6 +392,7 @@ GLOBAL_DEFINES += \
 	PLATFORM=\"$(PLATFORM)\" \
 	ARCH_$(ARCH)=1 \
 	ARCH=\"$(ARCH)\" \
+	LK_EMBEDDED=$(LK_EMBEDDED) \
 	$(addsuffix =1,$(addprefix WITH_,$(ALLMODULES)))
 
 # debug build?

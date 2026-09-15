@@ -36,6 +36,9 @@ static const void *fdt;
 static volatile uint32_t *power_reset_reg;
 
 void platform_early_init(void) {
+    // bring the console uart up first, so early output has somewhere to go
+    platform_init_uart_early();
+
     plic_early_init(PLIC_BASE_VIRT, NUM_IRQS, false);
 
     LTRACEF("starting FDT scan\n");
@@ -73,7 +76,7 @@ void platform_early_init(void) {
 
 void platform_init(void) {
     plic_init();
-    uart_init();
+    platform_init_uart();
 
     /* configure and start pci from device tree */
     status_t err = fdtwalk_setup_pci(fdt);

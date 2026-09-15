@@ -345,11 +345,22 @@ int arch_mmu_unmap(arch_aspace_t *const aspace, const vaddr_t vaddr, const uint 
         return ERR_INVALID_ARGS;
     }
 
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
     if (count == 0) {
         return NO_ERROR;
     }
 
-    return (x86_mmu_unmap(aspace->cr3, vaddr, count));
+    status_t err = x86_mmu_unmap(aspace->cr3, vaddr, count);
+    if (err < 0) {
+        return err;
+    }
+
+    /* the unmap only invalidated this cpu's translations */
+    x86_tlb_shootdown(vaddr, count);
+    return NO_ERROR;
 }
 
 /**
@@ -404,6 +415,10 @@ status_t arch_mmu_query(arch_aspace_t *const aspace, const vaddr_t vaddr, paddr_
         return ERR_INVALID_ARGS;
     }
 
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, 1)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
     arch_flags_t ret_flags;
     uint32_t ret_level;
     status_t stat = x86_mmu_get_mapping(aspace->cr3, vaddr, &ret_level, &ret_flags, paddr);
@@ -434,6 +449,10 @@ int arch_mmu_map(arch_aspace_t *const aspace, const vaddr_t vaddr, const paddr_t
 
     if ((!IS_ALIGNED(paddr, PAGE_SIZE)) || (!IS_ALIGNED(vaddr, PAGE_SIZE))) {
         return ERR_INVALID_ARGS;
+    }
+
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
     }
 
     if (count == 0) {
@@ -556,7 +575,7 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *const aspace) {
     return NO_ERROR;
 }
 
-void arch_mmu_context_switch(arch_aspace_t *const aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *const aspace) {
     if (TRACE_CONTEXT_SWITCH) {
         TRACEF("aspace %p\n", aspace);
     }

@@ -18,6 +18,7 @@ MODULE_DEPS += lib/fdtwalk
 MODULE_DEPS += dev/interrupt/riscv_plic
 MODULE_DEPS += dev/bus/pci
 MODULE_DEPS += dev/bus/pci/drivers
+MODULE_DEPS += dev/uart/dwc8250
 
 MODULE_SRCS += $(LOCAL_DIR)/platform.c
 MODULE_SRCS += $(LOCAL_DIR)/uart.c
@@ -34,5 +35,7 @@ GLOBAL_DEFINES += PLATFORM_SUPPORTS_PANIC_SHELL=1
 
 # do not need to implement any cache ops
 GLOBAL_DEFINES += RISCV_NO_CACHE_OPS=1
+
+MODULE_WEAK_DEPS += lib/minip
 
 include make/module.mk

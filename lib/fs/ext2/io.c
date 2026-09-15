@@ -7,6 +7,8 @@
  */
 
 #include "ext2_priv.h"
+#include <assert.h>
+#include <kernel/mutex.h>
 #include <lk/debug.h>
 #include <lk/trace.h>
 #include <stdlib.h>
@@ -15,14 +17,17 @@
 #define LOCAL_TRACE 0
 
 int ext2_read_block(ext2_t *ext2, void *buf, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_read_block(ext2->cache, buf, bnum);
 }
 
 int ext2_get_block(ext2_t *ext2, void **ptr, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_get_block(ext2->cache, ptr, bnum);
 }
 
 int ext2_put_block(ext2_t *ext2, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_put_block(ext2->cache, bnum);
 }
 
@@ -123,8 +128,8 @@ error:
     return err;
 }
 
-/* translate a file block to a physical block */
-static blocknum_t file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock) {
+/* translate a file block to a physical block; 0 means a hole */
+blocknum_t ext2_file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock) {
     int err;
     blocknum_t block;
 
@@ -132,13 +137,17 @@ static blocknum_t file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode,
 
     uint32_t pos[4];
     uint32_t level = 0;
-    ext2_calculate_block_pointer_pos(ext2, fileblock, &level, pos);
+    if (ext2_calculate_block_pointer_pos(ext2, fileblock, &level, pos) < 0) {
+        /* past the largest block a triple indirect inode can name; nothing is
+         * there, and indexing i_block with it would run off the inode */
+        return 0;
+    }
 
     LTRACEF("level %d, pos 0x%x 0x%x 0x%x 0x%x\n", level, pos[0], pos[1], pos[2], pos[3]);
 
     if (level == 0) {
         /* direct block, just return it directly */
-        block = LE32(inode->i_block[fileblock]);
+        block = LE32(inode->i_block[pos[0]]);
     } else {
         /* at least one level of indirection, get a pointer to the final indirect block table and dereference it */
         blocknum_t *ind_table;
@@ -187,20 +196,24 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
 
     /* handle partial first block */
     if ((offset % EXT2_BLOCK_SIZE(ext2->sb)) != 0) {
-        uint8_t temp[EXT2_BLOCK_SIZE(ext2->sb)];
-
-        /* calculate the block and read it */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
-        if (phys_block == 0) {
-            memset(temp, 0, EXT2_BLOCK_SIZE(ext2->sb));
-        } else {
-            ext2_read_block(ext2, temp, phys_block);
-        }
-
-        /* copy out what we need */
         size_t block_offset = offset % EXT2_BLOCK_SIZE(ext2->sb);
         size_t tocopy = MIN(len, EXT2_BLOCK_SIZE(ext2->sb) - block_offset);
-        memcpy(buf, temp + block_offset, tocopy);
+
+        /* calculate the block and copy the partial range straight out of the
+         * block cache: a block sized bounce buffer is too big for the stack
+         * (a whole page at 4K block size) and not worth an allocation */
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
+        if (phys_block == 0) {
+            memset(buf, 0, tocopy);
+        } else {
+            void *cache_ptr;
+            err = ext2_get_block(ext2, &cache_ptr, phys_block);
+            if (err < 0) {
+                return err;
+            }
+            memcpy(buf, (const uint8_t *)cache_ptr + block_offset, tocopy);
+            ext2_put_block(ext2, phys_block);
+        }
 
         /* increment our stuff */
         file_block++;
@@ -212,7 +225,7 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
     /* handle middle blocks */
     while (len >= EXT2_BLOCK_SIZE(ext2->sb)) {
         /* calculate the block and read it */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
         if (phys_block == 0) {
             memset(buf, 0, EXT2_BLOCK_SIZE(ext2->sb));
         } else {
@@ -228,18 +241,20 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
 
     /* handle partial last block */
     if (len > 0) {
-        uint8_t temp[EXT2_BLOCK_SIZE(ext2->sb)];
-
-        /* calculate the block and read it */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
+        /* calculate the block and copy the head of it out of the block cache,
+         * same as the partial first block above */
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
         if (phys_block == 0) {
-            memset(temp, 0, EXT2_BLOCK_SIZE(ext2->sb));
+            memset(buf, 0, len);
         } else {
-            ext2_read_block(ext2, temp, phys_block);
+            void *cache_ptr;
+            err = ext2_get_block(ext2, &cache_ptr, phys_block);
+            if (err < 0) {
+                return err;
+            }
+            memcpy(buf, cache_ptr, len);
+            ext2_put_block(ext2, phys_block);
         }
-
-        /* copy out what we need */
-        memcpy(buf, temp, len);
 
         /* increment our stuff */
         bytes_read += len;

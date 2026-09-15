@@ -162,7 +162,9 @@ static_assert(sizeof(tdesc) == 16, "");
 #define E1000_TXD_STAT_LC (1u << 2) // Late collision
 #define E1000_TXD_STAT_TU (1u << 3) // Transmit underrun
 
-// efficient copy for rx/tx descriptors out/into uncached memory
+// Efficient copy of a rx/tx descriptor to or from the ring. The 8 byte accesses keep the
+// device's view of a descriptor consistent; ordering against the head/tail registers is the
+// caller's job (see the barriers in e1000.cpp).
 template <typename T> inline void copy(T *_dst, const T *_src) {
     // only allow this for structs that are precisely 16 bytes long
     static_assert(sizeof(T) == 16, "");

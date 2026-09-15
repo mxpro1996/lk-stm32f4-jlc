@@ -4,13 +4,22 @@ name: LK CI (gcc)
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'   # Skip builds when only documentation changes
+      - 'LICENSE'
+      - 'docs/**'
   push:
     branches-ignore:
       - 'wip/**'
       - 'docs/**' # Skip builds for documentation branches
     paths-ignore:
-      - '**.md'   # Skip builds when only markdown files change
-      - 'docs/**' # Skip builds for docs directory changes
+      - '**.md'   # Skip builds when only documentation changes
+      - 'LICENSE'
+      - 'docs/**'
+
+# These jobs only build the tree; they never write back to the repo.
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -20,31 +29,24 @@ jobs:
       matrix:
         toolchain-ver: [15.2.0, 11.3.0]
         debug: [2, 0]
-        ubsan: [1, 0]
+        # UBSAN is not an axis here. It lives in github-ci-ubsan.yml, which builds
+        # the qemu projects and actually runs the unit tests under it -- compiling
+        # with -fsanitize=undefined without running anything found nothing.
         arch:
           - arm
           - arm64
           - m68k
           - mips
-          - or1k
           - riscv32
           - riscv64
           - x86
-        exclude:
-          # do not build ubsan for older 32bit arches where it is not well supported
-          - ubsan: 1
-            arch: m68k
-          - ubsan: 1
-            arch: mips
-          - ubsan: 1
-            arch: or1k
 
     env:
       ARCH: ${{ matrix.arch }}
       TOOLCHAIN_VER: ${{ matrix.toolchain-ver }}
       # ${{ matrix.toolchain-arch }}-${{ matrix.toolchain-ver }}-Linux-x86_64
-      DEBUG: ${{ matrix.debug }}
-      UBSAN: ${{ matrix.ubsan }}
+      # NOTE: DEBUG is deliberately not set here. buildall assigns it itself, so an
+      # inherited value is silently ignored; it is passed to it as -D instead.
       TOOLCHAIN: # compute below
       TOOLCHAIN_ALT: # compute below
     steps:
@@ -55,8 +57,7 @@ jobs:
         grep -oP '(?<=model name\t: ).*' /proc/cpuinfo|head -n1
         echo ARCH = $ARCH
         echo TOOLCHAIN_VER = $TOOLCHAIN_VER
-        echo DEBUG = $DEBUG
-        echo UBSAN = $UBSAN
+        echo DEBUG = ${{ matrix.debug }}
 
     # check out the source
     - name: checkout
@@ -71,7 +72,6 @@ jobs:
             arm64) TOOLCHAIN_PREFIX="aarch64-elf-" ;;
             m68k) TOOLCHAIN_PREFIX="m68k-elf-" ;;
             mips) TOOLCHAIN_PREFIX="mips-elf-" ;;
-            or1k) TOOLCHAIN_PREFIX="or1k-elf-" ;;
             riscv32) TOOLCHAIN_PREFIX="riscv32-elf-" ;;
             riscv64) TOOLCHAIN_PREFIX="riscv64-elf-" ;;
             x86) TOOLCHAIN_PREFIX="x86_64-elf-" ;;
@@ -138,9 +138,12 @@ jobs:
         export -n TOOLCHAIN_ALT
         export -n TOOLCHAIN_VER
         export -n ARCH
-        # DEBUG is passed through to the build script
-        # UBSAN is passed through to the build script
-        ./scripts/buildall -e -a "${{ matrix.arch }}"
+        # -D builds exactly this DEBUG level, so each matrix job covers one distinct
+        # configuration. Passing DEBUG in the environment does nothing: buildall
+        # sets it itself.
+        # -d fails the run if any module includes headers of a module it does not
+        # declare in MODULE_DEPS / MODULE_WEAK_DEPS (scripts/check-module-deps.py)
+        ./scripts/buildall -e -d -a "${{ matrix.arch }}" -D "${{ matrix.debug }}"
 
     # upload artifacts
     #- uses: actions/upload-artifact@v2

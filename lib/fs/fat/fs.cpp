@@ -15,6 +15,7 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <memory>
 #include <new>
 #include <stdlib.h>
@@ -61,28 +62,6 @@ __NO_INLINE static void fat_dump(fat_fs *fat) {
 
 fat_fs::fat_fs() = default;
 fat_fs::~fat_fs() = default;
-
-void fat_fs::add_to_file_list(fat_file *file) {
-    DEBUG_ASSERT(lock.is_held());
-    DEBUG_ASSERT(!list_in_list(&file->node_));
-
-    LTRACEF("file %p, location %u:%u\n", file, file->dir_loc().starting_dir_cluster, file->dir_loc().dir_offset);
-
-    list_add_head(&file_list_, &file->node_);
-}
-
-fat_file *fat_fs::lookup_file(const dir_entry_location &loc) {
-    DEBUG_ASSERT(lock.is_held());
-
-    fat_file *f;
-    list_for_every_entry(&file_list_, f, fat_file, node_) {
-        if (loc == f->dir_loc()) {
-            return f;
-        }
-    }
-
-    return nullptr;
-}
 
 status_t fat_fs::write_fsinfo_locked() {
     DEBUG_ASSERT(lock.is_held());
@@ -261,8 +240,30 @@ status_t fat_fs::fs_stat(fscookie *cookie, struct fs_stat *stat) {
     return NO_ERROR;
 }
 
+// wrap a directory entry in a vnode the layer takes ownership of
+status_t fat_vnode_create(fat_fs *fat, const dir_entry &entry, const dir_entry_location &loc,
+                          uint32_t record_start_offset, struct fs_vnode **out) {
+    auto *v = new (std::nothrow) fat_vnode(fat, entry, loc, record_start_offset);
+    if (!v) {
+        return ERR_NO_MEMORY;
+    }
+
+    status_t err = fs_vnode_create(v->id(), v->is_dir() ? FS_VNODE_DIR : FS_VNODE_FILE, v, out);
+    if (err < 0) {
+        delete v;
+    }
+
+    return err;
+}
+
+// last reference to a vnode dropped; the object it described stays on disk
+static void fat_release(struct fs_vnode *vn) {
+    delete vnode_of(vn);
+}
+
 // static fs hooks
-status_t fat_fs::mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options) {
+status_t fat_fs::mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,
+                       struct fs_vnode **root) {
     status_t result = NO_ERROR;
 
     if (!dev) {
@@ -293,9 +294,14 @@ status_t fat_fs::mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options opt
     fat->dev_ = dev;
     fat->read_only_ = (options & FS_MOUNT_OPTION_READ_ONLY) != 0;
 
-    // if we early terminate, free the fat structure. Not a unique_ptr: the
+    // if we early terminate, tear down whatever we built. Not a unique_ptr: the
     // destructor is private, so only a member of fat_fs can delete one.
-    auto ac2 = lk::make_auto_call([&]() { delete (fat); });
+    auto ac2 = lk::make_auto_call([&]() {
+        if (fat->bcache_) {
+            bcache_destroy(fat->bcache_);
+        }
+        delete (fat);
+    });
 
     auto *info = &fat->info_;
 
@@ -475,13 +481,13 @@ status_t fat_fs::mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options opt
     dprintf(INFO, "FAT: creating bcache of %d entries of %u bytes\n", bcache_size, info->bytes_per_sector);
 
     fat->bcache_ = bcache_create(fat->dev(), info->bytes_per_sector, bcache_size);
+    if (!fat->bcache_) {
+        return ERR_NO_MEMORY;
+    }
 
     if (fat->read_only_) {
         bcache_set_read_only(fat->bcache_, true);
     }
-
-    // we're okay, cancel our cleanup of the fat structure
-    ac2.cancel();
 
 #if LOCAL_TRACE
     printf("Mounted FAT volume, some information:\n");
@@ -498,6 +504,22 @@ status_t fat_fs::mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options opt
     }
     bcache_flush(fat->bcache_);
 
+    // The root directory has no entry naming it anywhere, so it gets the location
+    // no real object can hold. Last fallible step of the mount, so the unwind above
+    // never has a vnode to dispose of: the layer has not seen it yet.
+    const dir_entry root_entry = {
+        .attributes = fat_attribute::directory,
+        .length = 0,
+        .start_cluster = (info->fat_bits == 32) ? info->root_cluster : 0,
+    };
+    status_t vnode_err = fat_vnode_create(fat, root_entry, kRootDirLocation, 0, root);
+    if (vnode_err < 0) {
+        return vnode_err;
+    }
+
+    // we're okay, cancel our cleanup of the fat structure
+    ac2.cancel();
+
     *cookie = (fscookie *)fat;
 
     return result;
@@ -509,9 +531,6 @@ status_t fat_fs::unmount(fscookie *cookie) {
 
     {
         AutoLock guard(fat->lock);
-
-        // TODO: handle unmounting when files/dirs are active
-        DEBUG_ASSERT(list_is_empty(&fat->file_list_));
 
         if (LK_DEBUGLEVEL > INFO) {
             bcache_dump(fat->bcache(), "FAT bcache ");
@@ -531,26 +550,29 @@ status_t fat_fs::unmount(fscookie *cookie) {
 
 static const struct fs_api fat_api = {
     .format = fat_fs::format,
-    .fs_stat = fat_fs::fs_stat,
-
     .mount = fat_fs::mount,
     .unmount = fat_fs::unmount,
-    .open = fat_file::open_file,
-    .create = fat_file::create_file,
-    .remove = fat_dir::remove,
-    .rmdir = fat_dir::rmdir,
-    .truncate = fat_file::truncate_file,
-    .stat = fat_file::stat_file,
-    .read = fat_file::read_file,
-    .write = fat_file::write_file,
-    .close = fat_file::close_file,
+    .fs_stat = fat_fs::fs_stat,
 
-    .mkdir = fat_dir::mkdir,
-    .opendir = fat_dir::opendir,
-    .readdir = fat_dir::readdir,
-    .closedir = fat_dir::closedir,
+    .lookup = fat_lookup,
+    .create = fat_create,
+    .mkdir = fat_mkdir,
+    .unlink = fat_unlink,
+    .rmdir = fat_rmdir,
+    // no rename yet, and FAT has no symlinks
+    .rename = nullptr,
+    .readlink = nullptr,
+    .release = fat_release,
 
-    .file_ioctl = nullptr,
+    .read = fat_read,
+    .write = fat_write,
+    .truncate = fat_truncate,
+    .stat = fat_stat,
+    .ioctl = nullptr,
+
+    .opendir = fat_opendir,
+    .readdir = fat_readdir,
+    .closedir = fat_closedir,
 };
 
 STATIC_FS_IMPL(fat, &fat_api);

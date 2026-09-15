@@ -61,7 +61,7 @@ static ssize_t elf_read_hook_memory(struct elf_handle *handle, void *buf, uint64
 
     memcpy(buf, args->ptr + offset, toread);
 
-    LTRACEF("returning %ld\n", toread);
+    LTRACEF("returning %zd\n", toread);
 
     return toread;
 }
@@ -191,14 +191,15 @@ status_t elf_load(elf_handle_t *handle) {
     }
 
     // allocate and read in the program headers
-    handle->pheaders = calloc(1, handle->eheader.e_phnum * handle->eheader.e_phentsize);
+    const size_t phdr_size = (size_t)handle->eheader.e_phnum * handle->eheader.e_phentsize;
+    handle->pheaders = calloc(1, phdr_size);
     if (!handle->pheaders) {
         LTRACEF("failed to allocate memory for program headers\n");
         return ERR_NO_MEMORY;
     }
 
-    readerr = handle->read_hook(handle, handle->pheaders, handle->eheader.e_phoff, handle->eheader.e_phnum * handle->eheader.e_phentsize);
-    if (readerr < (ssize_t)(handle->eheader.e_phnum * handle->eheader.e_phentsize)) {
+    readerr = handle->read_hook(handle, handle->pheaders, handle->eheader.e_phoff, phdr_size);
+    if (readerr < (ssize_t)phdr_size) {
         LTRACEF("failed to read program headers\n");
         return ERR_NO_MEMORY;
     }
@@ -234,7 +235,7 @@ status_t elf_load(elf_handle_t *handle) {
             LTRACEF("reading segment at offset 0x" ELF_OFF_PRINT_X " to address %p\n", pheader->p_offset, ptr);
             readerr = handle->read_hook(handle, ptr, pheader->p_offset, pheader->p_filesz);
             if (readerr < (ssize_t)pheader->p_filesz) {
-                LTRACEF("error %ld reading program header %u\n", readerr, i);
+                LTRACEF("error %zd reading program header %u\n", readerr, i);
                 return (readerr < 0) ? readerr : ERR_IO;
             }
 

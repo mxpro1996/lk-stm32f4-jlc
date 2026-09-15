@@ -6,6 +6,8 @@
 # MODULE_SRCS : list of source files, local path (required)
 # MODULE_FLOAT_SRCS : list of source files compiled with floating point support (if available)
 # MODULE_DEPS : other modules that this one depends on
+# MODULE_WEAK_DEPS : modules whose headers this one uses only when they happen to be in the
+#   build (code guarded by WITH_<module>); recorded as a dependency but does not pull them in
 # MODULE_DEFINES : #defines local to this module
 # MODULE_OPTFLAGS : OPTFLAGS local to this module
 # MODULE_COMPILEFLAGS : COMPILEFLAGS local to this module
@@ -62,6 +64,12 @@ endif
 # add the listed module deps to the global list
 MODULES += $(MODULE_DEPS)
 
+# weak deps are only recorded (see MODULE_WEAK_DEPS in the module's module_config.h and
+# scripts/check-module-deps.py); a module in both lists is a mistake
+ifneq ($(filter $(MODULE_WEAK_DEPS),$(MODULE_DEPS)),)
+$(error MODULE $(MODULE) lists $(filter $(MODULE_WEAK_DEPS),$(MODULE_DEPS)) in both MODULE_DEPS and MODULE_WEAK_DEPS)
+endif
+
 # parse options
 MODULE_OPTIONS_COPY := $(sort $(MODULE_OPTIONS))
 ifneq (,$(findstring float,$(MODULE_OPTIONS)))
@@ -99,6 +107,32 @@ ifneq ($(MODULE_OPTIONS_COPY),)
 $(error MODULE $(MODULE) has unrecognized option(s) $(MODULE_OPTIONS_COPY))
 endif
 
+MODULE_DEFINES += MODULE_NAME=\"$(subst $(SPACE),_,$(MODULE))\"
+MODULE_DEFINES += MODULE_OPTIONS=\"$(subst $(SPACE),_,$(MODULE_OPTIONS))\"
+MODULE_DEFINES += MODULE_COMPILEFLAGS=\"$(subst $(SPACE),_,$(MODULE_COMPILEFLAGS))\"
+MODULE_DEFINES += MODULE_CFLAGS=\"$(subst $(SPACE),_,$(MODULE_CFLAGS))\"
+MODULE_DEFINES += MODULE_CPPFLAGS=\"$(subst $(SPACE),_,$(MODULE_CPPFLAGS))\"
+MODULE_DEFINES += MODULE_ASMFLAGS=\"$(subst $(SPACE),_,$(MODULE_ASMFLAGS))\"
+MODULE_DEFINES += MODULE_OPTFLAGS=\"$(subst $(SPACE),_,$(MODULE_OPTFLAGS))\"
+MODULE_DEFINES += MODULE_INCLUDES=\"$(subst $(SPACE),_,$(MODULE_INCLUDES))\"
+MODULE_DEFINES += MODULE_SRCDEPS=\"$(subst $(SPACE),_,$(MODULE_SRCDEPS))\"
+MODULE_DEFINES += MODULE_DEPS=\"$(subst $(SPACE),_,$(MODULE_DEPS))\"
+MODULE_DEFINES += MODULE_WEAK_DEPS=\"$(subst $(SPACE),_,$(MODULE_WEAK_DEPS))\"
+MODULE_DEFINES += MODULE_SRCS=\"$(subst $(SPACE),_,$(MODULE_SRCS))\"
+MODULE_DEFINES += MODULE_FLOAT_SRCS=\"$(subst $(SPACE),_,$(MODULE_FLOAT_SRCS))\"
+MODULE_DEFINES += MODULE_ARM_OVERRIDE_SRCS=\"$(subst $(SPACE),_,$(MODULE_ARM_OVERRIDE_SRCS))\"
+
+# generate a per-module config.h file. A module with nothing to compile gets one
+# too: scripts/check-module-deps.py learns the modules in a build and their
+# MODULE_DEPS / MODULE_WEAK_DEPS from these files.
+MODULE_CONFIG := $(MODULE_BUILDDIR)/module_config.h
+
+$(MODULE_CONFIG): MODULE_DEFINES:=$(MODULE_DEFINES)
+$(MODULE_CONFIG): configheader
+	@$(call MAKECONFIGHEADER,$@,MODULE_DEFINES)
+
+GENERATED += $(MODULE_CONFIG)
+
 # if MODULE_SRCS and MODULE_FLOAT_SRCS are both empty, skip the rest of this
 # file as there is nothing to build for this module.
 ifneq ($(MODULE_SRCS)$(MODULE_FLOAT_SRCS)$(MODULE_ARM_OVERRIDE_SRCS),)
@@ -112,29 +146,6 @@ ifneq ($(MODULE_SRCS)$(MODULE_FLOAT_SRCS)$(MODULE_ARM_OVERRIDE_SRCS),)
 #$(info MODULE_FLOAT_SRCS $(MODULE_FLOAT_SRCS))
 #$(info MODULE_ARM_OVERRIDE_SRCS $(MODULE_ARM_OVERRIDE_SRCS))
 #$(info MODULE_OPTIONS $(MODULE_OPTIONS))
-
-MODULE_DEFINES += MODULE_NAME=\"$(subst $(SPACE),_,$(MODULE))\"
-MODULE_DEFINES += MODULE_OPTIONS=\"$(subst $(SPACE),_,$(MODULE_OPTIONS))\"
-MODULE_DEFINES += MODULE_COMPILEFLAGS=\"$(subst $(SPACE),_,$(MODULE_COMPILEFLAGS))\"
-MODULE_DEFINES += MODULE_CFLAGS=\"$(subst $(SPACE),_,$(MODULE_CFLAGS))\"
-MODULE_DEFINES += MODULE_CPPFLAGS=\"$(subst $(SPACE),_,$(MODULE_CPPFLAGS))\"
-MODULE_DEFINES += MODULE_ASMFLAGS=\"$(subst $(SPACE),_,$(MODULE_ASMFLAGS))\"
-MODULE_DEFINES += MODULE_OPTFLAGS=\"$(subst $(SPACE),_,$(MODULE_OPTFLAGS))\"
-MODULE_DEFINES += MODULE_INCLUDES=\"$(subst $(SPACE),_,$(MODULE_INCLUDES))\"
-MODULE_DEFINES += MODULE_SRCDEPS=\"$(subst $(SPACE),_,$(MODULE_SRCDEPS))\"
-MODULE_DEFINES += MODULE_DEPS=\"$(subst $(SPACE),_,$(MODULE_DEPS))\"
-MODULE_DEFINES += MODULE_SRCS=\"$(subst $(SPACE),_,$(MODULE_SRCS))\"
-MODULE_DEFINES += MODULE_FLOAT_SRCS=\"$(subst $(SPACE),_,$(MODULE_FLOAT_SRCS))\"
-MODULE_DEFINES += MODULE_ARM_OVERRIDE_SRCS=\"$(subst $(SPACE),_,$(MODULE_ARM_OVERRIDE_SRCS))\"
-
-# generate a per-module config.h file
-MODULE_CONFIG := $(MODULE_BUILDDIR)/module_config.h
-
-$(MODULE_CONFIG): MODULE_DEFINES:=$(MODULE_DEFINES)
-$(MODULE_CONFIG): configheader
-	@$(call MAKECONFIGHEADER,$@,MODULE_DEFINES)
-
-GENERATED += $(MODULE_CONFIG)
 
 MODULE_COMPILEFLAGS += -include $(MODULE_CONFIG)
 
@@ -174,7 +185,8 @@ ALLMODULE_OBJS := $(ALLMODULE_OBJS) $(MODULE_OBJS) $(MODULE_EXTRA_OBJS)
 endif
 
 else # ifneq ($(MODULE_ALL_SRCS),)
-#$(info MODULE $(MODULE) has no source files, skipping)
+# nothing to compile, so nothing depends on the config header; build it explicitly
+EXTRA_BUILDDEPS += $(MODULE_CONFIG)
 endif
 
 # empty out any vars set here
@@ -182,6 +194,7 @@ MODULE :=
 MODULE_SRCDIR :=
 MODULE_BUILDDIR :=
 MODULE_DEPS :=
+MODULE_WEAK_DEPS :=
 MODULE_SRCS :=
 MODULE_FLOAT_SRCS :=
 MODULE_OBJS :=

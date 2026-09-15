@@ -224,10 +224,14 @@ decoded:
         *REG32(INTC_LOCAL_MAILBOX0_CLR0 + 0x10 * cpu) = pend;
 
         if (pend & (1 << MP_IPI_GENERIC)) {
-            PANIC_UNIMPLEMENTED;
+            if (mp_mbx_generic_irq() == INT_RESCHEDULE) {
+                ret = INT_RESCHEDULE;
+            }
         }
         if (pend & (1 << MP_IPI_RESCHEDULE)) {
-            ret = mp_mbx_reschedule_irq();
+            if (mp_mbx_reschedule_irq() == INT_RESCHEDULE) {
+                ret = INT_RESCHEDULE;
+            }
         }
     } else
 #endif // WITH_SMP

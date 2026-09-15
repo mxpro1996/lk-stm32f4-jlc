@@ -1366,7 +1366,7 @@ usage:
             uint8_t buf[512];
 
             ssize_t err_len = tcp_read(accepted, buf, sizeof(buf));
-            printf("tcp_read returns %ld\n", err_len);
+            printf("tcp_read returns %zd\n", err_len);
             if (err_len < 0)
                 break;
             if (err_len > 0) {
@@ -1374,7 +1374,7 @@ usage:
             }
 
             err_len = tcp_write(accepted, buf, err_len);
-            printf("tcp_write returns %ld\n", err_len);
+            printf("tcp_write returns %zd\n", err_len);
             if (err_len < 0)
                 break;
         }

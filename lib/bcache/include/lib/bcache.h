@@ -14,6 +14,12 @@ __BEGIN_CDECLS
 
 typedef void *bcache_t;
 
+/* None of these routines lock. A cache instance holds a fixed, small number of
+ * blocks on an LRU that every call rearranges, so callers must serialize their
+ * own access to one: two threads in here at once can have a block evicted and
+ * refilled underneath them, leaving a pointer from bcache_get_block() naming
+ * another block's contents, or exhaust the blocks outright. */
+
 bcache_t bcache_create(bdev_t *dev, size_t block_size, int block_count);
 void bcache_set_read_only(bcache_t priv, bool ro);
 void bcache_destroy(bcache_t);

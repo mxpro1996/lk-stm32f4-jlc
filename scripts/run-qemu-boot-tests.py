@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import shlex
 import subprocess
 import sys
 import os
@@ -22,6 +23,34 @@ class QEMUTestRunner:
             'arm64': {
                 'script': 'do-qemuarm',
                 'args': '-6s4',
+                'timeout': 90
+            },
+            # The cortex-m boards qemu models for ARM's MPS2/MPS3 prototyping
+            # systems, one per core generation. These exercise arch/arm/arm-m,
+            # which nothing else here covers.
+            'arm-m3': {
+                'script': 'do-qemuarm',
+                'args': '-Ban385',
+                'timeout': 90
+            },
+            'arm-m4': {
+                'script': 'do-qemuarm',
+                'args': '-Ban386',
+                'timeout': 90
+            },
+            'arm-m7': {
+                'script': 'do-qemuarm',
+                'args': '-Ban500',
+                'timeout': 90
+            },
+            'arm-m33': {
+                'script': 'do-qemuarm',
+                'args': '-Ban505',
+                'timeout': 90
+            },
+            'arm-m55': {
+                'script': 'do-qemuarm',
+                'args': '-Ban547',
                 'timeout': 90
             },
             'm68k': {
@@ -49,10 +78,29 @@ class QEMUTestRunner:
                 'script': 'do-qemux86',
                 'args': '-6s4',
                 'timeout': 90
+            },
+            # same kernels on the i440fx/PIIX machine: no MCFG/ECAM (legacy
+            # config access), PIC-mode _PRT link devices, PIIX IDE
+            'x86-i440fx': {
+                'script': 'do-qemux86',
+                'args': '-M pc -s4',
+                'timeout': 90
+            },
+            'x86-64-i440fx': {
+                'script': 'do-qemux86',
+                'args': '-6 -M pc -s4',
+                'timeout': 90
+            },
+            # same kernel booted through OVMF via the EFI stub; the extra
+            # timeout headroom covers the firmware and EFI shell startup delay
+            'x86-64-uefi': {
+                'script': 'do-qemux86',
+                'args': '-us4',
+                'timeout': 120
             }
         }
 
-    def run_qemu_test(self, arch, arch_config, quiet=False, log_dir=None, disk_images=None, append_cmdline=None, toolchain='gcc', timeout=None):
+    def run_qemu_test(self, arch, arch_config, quiet=False, log_dir=None, disk_images=None, append_cmdline=None, toolchain='gcc', timeout=None, ubsan=False):
         """Run QEMU for the specified architecture and monitor for test completion"""
         tc_label = f" ({toolchain})" if toolchain != 'gcc' else ""
         print(f"\nRunning QEMU test for {arch}{tc_label}...")
@@ -68,6 +116,9 @@ class QEMUTestRunner:
 
         # Create environment with toolchain settings
         env = {**os.environ, 'LK_ROOT': str(self.lk_root)}
+        if ubsan:
+            # the do-qemu* scripts build before launching, so this reaches the build
+            env['UBSAN'] = '1' 
         if toolchain in ('clang', 'clang-lld'):
             env['TOOLCHAIN'] = 'clang'
             if toolchain == 'clang-lld':
@@ -82,7 +133,7 @@ class QEMUTestRunner:
         # Create the QEMU commandline
         qemu_cmdline = [str(script_path)]
         if arch_config['args']:
-            qemu_cmdline.append(str(arch_config['args']))
+            qemu_cmdline.extend(shlex.split(str(arch_config['args'])))
         # Drive the test run from a shell script passed on the kernel command line.
         # Spaces are encoded as '+' so the value passes through the do-qemu* wrappers
         # unquoted. The sleep gives device probing a chance to settle and the poweroff
@@ -130,6 +181,10 @@ class QEMUTestRunner:
             buffer = ''
             test_passed = False
             test_failed = False
+            # Sites reported by lib/ubsan at runtime. Only meaningful with --ubsan,
+            # and a report is a failure: the kernel did something undefined even if
+            # every test case still passed.
+            ubsan_sites = []
 
             # Use select + nonblocking fd to avoid blocking on partial lines
             import select, fcntl, os as _os
@@ -180,6 +235,11 @@ class QEMUTestRunner:
                             sys.stdout.flush()
                             break
 
+                    # Collect UBSAN reports. lib/ubsan prints one
+                    # "ubsan: <what> in <file>:<line>:<col>" line per report.
+                    if ubsan and 'ubsan: ' in line.lower():
+                        ubsan_sites.append(line.strip())
+
                     # Check for failure indicators
                     for indicator in failure_indicators:
                         if indicator.lower() in line.lower():
@@ -188,10 +248,13 @@ class QEMUTestRunner:
                             sys.stdout.flush()
                             break
 
-                    if test_passed or test_failed:
+                    # In UBSAN mode keep reading to EOF so reports emitted after the
+                    # test summary are still counted; qemu exits on its own via the
+                    # poweroff at the end of the autorun script.
+                    if test_failed or (test_passed and not ubsan):
                         break
 
-                if test_passed or test_failed:
+                if test_failed or (test_passed and not ubsan):
                     break
 
                 if eof:
@@ -231,6 +294,17 @@ class QEMUTestRunner:
                     print(f"[{arch}] failed to write log: {le}")
                     sys.stdout.flush()
 
+            if ubsan and ubsan_sites:
+                counts = {}
+                for site in ubsan_sites:
+                    key = site.split(' in ', 1)[-1] if ' in ' in site else site
+                    counts[key] = counts.get(key, 0) + 1
+                print(f"\u2717 {len(ubsan_sites)} UBSAN report(s) for {arch}, {len(counts)} distinct site(s):")
+                for key, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+                    print(f"    {n:5d}  {key}")
+                sys.stdout.flush()
+                return False
+
             return test_passed and not test_failed
 
         except Exception as e:
@@ -238,7 +312,7 @@ class QEMUTestRunner:
             sys.stdout.flush()
             return False
 
-    def run_all_tests(self, selected_archs=None, quiet=False, log_dir=None, disk_images=None, append_cmdline=None, toolchain='gcc', timeout=None):
+    def run_all_tests(self, selected_archs=None, quiet=False, log_dir=None, disk_images=None, append_cmdline=None, toolchain='gcc', timeout=None, ubsan=False):
         """Run tests for all or selected architectures"""
         if selected_archs is None:
             selected_archs = list(self.architectures.keys())
@@ -253,7 +327,7 @@ class QEMUTestRunner:
             arch_config = self.architectures[arch]
 
             # Run the test
-            results[arch] = self.run_qemu_test(arch, arch_config, quiet, log_dir, disk_images, append_cmdline, toolchain, timeout)
+            results[arch] = self.run_qemu_test(arch, arch_config, quiet, log_dir, disk_images, append_cmdline, toolchain, timeout, ubsan)
 
         return results
 
@@ -317,7 +391,10 @@ class QEMUTestRunner:
 
 def main():
     parser = argparse.ArgumentParser(description='Run LK QEMU tests for multiple architectures')
-    parser.add_argument('--arch', choices=['arm', 'arm64', 'm68k', 'riscv32', 'riscv64', 'x86', 'x86-64'], action='append',
+    parser.add_argument('--arch', choices=['arm', 'arm64', 'arm-m3', 'arm-m4', 'arm-m7',
+                                          'arm-m33', 'arm-m55', 'm68k', 'riscv32', 'riscv64',
+                                          'x86', 'x86-64', 'x86-i440fx', 'x86-64-i440fx',
+                                          'x86-64-uefi'], action='append',
                        help='Architecture to test (can be specified multiple times)')
     parser.add_argument('--lk-root', default='.',
                        help='Path to LK root directory (default: current directory)')
@@ -335,6 +412,8 @@ def main():
                        help='Build and run tests using Clang toolchain with LLD linker')
     parser.add_argument('--toolchain', choices=['gcc', 'clang', 'clang-lld'], default=None,
                        help='Specify toolchain to use (gcc, clang, or clang-lld)')
+    parser.add_argument('--ubsan', action='store_true',
+                        help='build with UBSAN=1 and fail if the run reports any undefined behavior')
     parser.add_argument('--timeout', type=int, default=None, metavar='SECONDS',
                        help='Override the per-architecture QEMU timeout (default: 30s)')
 
@@ -355,7 +434,7 @@ def main():
     runner = QEMUTestRunner(lk_root)
 
     # Run tests
-    results = runner.run_all_tests(args.arch, args.quiet, args.log_dir, args.disk_images, args.append_cmdline, toolchain=toolchain, timeout=args.timeout)
+    results = runner.run_all_tests(args.arch, args.quiet, args.log_dir, args.disk_images, args.append_cmdline, toolchain=toolchain, timeout=args.timeout, ubsan=args.ubsan)
 
     # Print summary and return appropriate exit code
     return runner.print_summary(results, args.log_dir, toolchain=toolchain)

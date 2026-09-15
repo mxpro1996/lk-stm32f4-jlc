@@ -13,6 +13,8 @@ MEMSIZE := 0x00082000
 ARCH := arm
 ARM_CPU := cortex-m33
 
+LK_EMBEDDED := 1
+
 GLOBAL_DEFINES += \
 	MEMSIZE=$(MEMSIZE) \
 	ARM_CM_SET_VTOR=1 \
@@ -105,5 +107,7 @@ $(UF2BIN): $(OUTBIN) $(UF2CONV_TOOL)
 
 EXTRA_BUILDDEPS += $(UF2BIN)
 GENERATED += $(UF2BIN)
+
+MODULE_DEPS += lib/io
 
 include make/module.mk

@@ -7,6 +7,8 @@
  */
 #pragma once
 
+/* before arch/ops.h so it leaves out its empty arch_spinloop_pause() */
+#define ARCH_HAS_SPINLOOP_PAUSE 1
 #include <arch/ops.h>
 #include <lk/compiler.h>
 #include <lk/debug.h>
@@ -21,6 +23,12 @@ static inline struct thread *arch_get_current_thread(void) {
 
 static inline void arch_set_current_thread(struct thread *t) {
     riscv_set_current_thread(t);
+}
+
+static inline void arch_spinloop_pause(void) {
+    /* Zihintpause "pause", spelled out so it assembles without the extension in
+     * -march; a core without the extension executes it as an empty fence */
+    __asm__ volatile(".insn i 0x0f, 0, x0, x0, 0x010" ::: "memory");
 }
 
 static inline ulong arch_cycle_count(void) {

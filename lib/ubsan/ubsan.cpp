@@ -172,7 +172,7 @@ static void ubsan_report_end()
 static void do_ubsan_type_mismatch_nullptr(const ubsan_type_mismatch_data *data, size_t ptr)
 {
     ubsan_report_start(&data->location, "Null pointer dereference");
-    printf("%s null pointer of type %sn", type_check_kinds[data->type_check_kind],
+    printf("%s null pointer of type %s\n", type_check_kinds[data->type_check_kind],
            data->type->typename_);
     ubsan_report_end();
 }
@@ -189,7 +189,7 @@ static void do_ubsan_type_mismatch_unaligned(const ubsan_type_mismatch_data *dat
 static void do_ubsan_type_mismatch_objsize(const ubsan_type_mismatch_data *data, size_t ptr)
 {
     ubsan_report_start(&data->location, "Insufficient object size");
-    printf("%s address %p with insuficient space for type %s\n",
+    printf("%s address %p with insufficient space for type %s\n",
            type_check_kinds[data->type_check_kind], (void *) ptr, data->type->typename_);
     ubsan_report_end();
 }
@@ -314,7 +314,7 @@ static void ubsan_handle_integer_overflow(const ubsan_overflow_data *data, size_
 
     ubsan_report_start(&data->location, "Integer overflow");
 
-    printf("%s integer overflow: %s %s %s can't be represented in type %s",
+    printf("%s integer overflow: %s %s %s can't be represented in type %s\n",
            signed_ ? "signed" : "unsigned", lhs_v.to_string().c_str(), op,
            rhs_v.to_string().c_str(), data->type->typename_);
     ubsan_report_end();
@@ -393,11 +393,11 @@ void ubsan_handle_shift_out_of_bounds(const ubsan_shift_oob_data *data, ssize_t 
 
     if (ubsan_type_is_signed_int(rhs_t) && rhs < 0)
     {
-        printf("shift exponent %ld is negative\n", rhs);
+        printf("shift exponent %zd is negative\n", rhs);
     }
     else if ((size_t) rhs >= ubsan_type_get_int_width(lhs_t))
     {
-        printf("shift exponent %ld is too large for %zu-bit type %s\n", rhs,
+        printf("shift exponent %zd is too large for %zu-bit type %s\n", rhs,
                ubsan_type_get_int_width(lhs_t), lhs_t->typename_);
     }
     else
@@ -547,7 +547,7 @@ struct ubsan_vla_bound_data
 __USED void __ubsan_handle_vla_bound_not_positive(ubsan_vla_bound_data *data, ssize_t val)
 {
     ubsan_report_start(&data->location, "vla bound not positive");
-    printf("vla bound not positive (%ld)\n", val);
+    printf("vla bound not positive (%zd)\n", val);
     ubsan_report_end();
 }
 
@@ -557,10 +557,83 @@ __USED void __ubsan_handle_vla_bound_not_positive_abort(ubsan_vla_bound_data *da
     ubsan_abort();
 }
 
-// Note: we used to have __ubsan_handle_function_type_mismatch but it seems to have been dropped
-// from both GCC and clang
+struct ubsan_function_type_mismatch_data {
+    ubsan_source_location location;
+    ubsan_type_descriptor *type;
+    val function_ptr;
+};
 
-// Note 2: Do we want full CFI support? UBSAN seems to have dropped the OG bad_cfi_call check
+__USED void __ubsan_handle_function_type_mismatch(ubsan_function_type_mismatch_data *data, size_t ptr)
+{
+    ubsan_report_start(&data->location, "function type mismatch");
+    printf("Call function(%p) through pointer with incompatible type %s\n",
+           (void *) ptr, data->type->typename_);
+    ubsan_report_end();
+}
 
-// Note 3: Keep adding needed/wanted stuff
+__USED void __ubsan_handle_function_type_mismatch_abort(ubsan_function_type_mismatch_data *data, size_t ptr)
+{
+    __ubsan_handle_function_type_mismatch(data, ptr);
+    ubsan_abort();
+}
+
+struct ubsan_alignment_assumption_data {
+    struct ubsan_source_location location;
+    struct ubsan_source_location assumption_location;
+    struct ubsan_type_descriptor *type;
+};
+
+__USED void __ubsan_handle_alignment_assumption(ubsan_alignment_assumption_data *data, ssize_t ptr,
+                                                ssize_t align, ssize_t offset)
+{
+    size_t real_ptr;
+    ubsan_report_start(&data->location, "Alignment Error");
+    if (offset)
+        printf("assumption of %zd byte alignment (with offset of %zd byte) for pointer of type %s failed,",
+               align, offset, data->type->typename_);
+    else
+        printf("assumption of %zd byte alignment for pointer of type %s failed,",
+               align, data->type->typename_);
+
+    real_ptr = ptr - offset;
+    printf(" %saddress is %zu aligned, misalignment offset is %zd bytes\n",
+            offset ? "offset " : "", real_ptr ? (real_ptr & (0 - real_ptr)) : 1,
+            (ssize_t)(real_ptr & (align - 1)));
+
+    ubsan_report_end();
+}
+
+__USED void __ubsan_handle_alignment_assumption_abort(ubsan_alignment_assumption_data *data,
+                                                      ssize_t ptr, ssize_t align, ssize_t offset)
+{
+    __ubsan_handle_alignment_assumption(data, ptr, align, offset);
+    ubsan_abort();
+}
+
+struct ubsan_float_cast_data {
+    struct ubsan_source_location location;
+    struct ubsan_type_descriptor *from_type;
+    struct ubsan_type_descriptor *to_type;
+};
+
+// the value is passed as an opaque handle whose representation depends on the
+// source type, and val::to_string() only knows how to decode integers, so
+// report the conversion rather than pretending to print the value.
+__USED void __ubsan_handle_float_cast_overflow(ubsan_float_cast_data *data, size_t value)
+{
+    ubsan_report_start(&data->location, "Float Cast Overflow");
+    printf("value of type %s is outside the range of representable values of type %s\n",
+            data->from_type->typename_, data->to_type->typename_);
+    ubsan_report_end();
+}
+
+__USED void __ubsan_handle_float_cast_overflow_abort(ubsan_float_cast_data *data, size_t value)
+{
+    __ubsan_handle_float_cast_overflow(data, value);
+    ubsan_abort();
+}
+
+// Note 1: Do we want full CFI support? UBSAN seems to have dropped the OG bad_cfi_call check
+
+// Note 2: Keep adding needed/wanted stuff
 }

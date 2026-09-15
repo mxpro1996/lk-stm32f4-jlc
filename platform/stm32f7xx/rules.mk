@@ -30,6 +30,8 @@ ifeq ($(FOUND_CHIP),)
 $(error unknown STM32F7xx chip $(STM32_CHIP))
 endif
 
+LK_EMBEDDED := 1
+
 LK_HEAP_IMPLEMENTATION ?= miniheap
 
 GLOBAL_DEFINES += \
@@ -66,5 +68,7 @@ MODULE_DEPS += \
 	dev/usb \
 	lib/bio \
 	lib/cbuf
+
+MODULE_WEAK_DEPS += lib/minip
 
 include make/module.mk

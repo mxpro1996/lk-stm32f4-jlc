@@ -245,7 +245,15 @@ void riscv_exception_entry(void);
 enum handler_return riscv_timer_exception(void);
 enum handler_return riscv_software_exception(void);
 enum handler_return riscv_platform_irq(void);
+// Hooks for traps taken from user mode, both weak. The syscall hook sees epc
+// already advanced past the ecall; the other gets every remaining synchronous
+// exception from U-mode. The defaults print the frame and end the thread.
 void riscv_syscall_handler(struct riscv_short_iframe *frame);
+void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame);
+
+// what the hooks do unless overridden; an override can fall back to these
+void riscv_syscall_unhandled(struct riscv_short_iframe *frame) __NO_RETURN;
+void riscv_user_exception_unhandled(long cause, ulong epc, struct riscv_short_iframe *frame) __NO_RETURN;
 
 // If using S mode, time seems to be implemented in clint.h
 // TODO: clean up by moving into its own header

@@ -32,6 +32,9 @@
 static const void *fdt;
 
 void platform_early_init(void) {
+    // bring the console uart up first, so early output has somewhere to go
+    platform_init_uart_early();
+
     TRACE;
     plic_early_init(PLIC_BASE_VIRT, NUM_IRQS, false);
 
@@ -62,7 +65,7 @@ void platform_early_init(void) {
 
 void platform_init(void) {
     plic_init();
-    uart_init();
+    platform_init_uart();
 }
 
 static void reboot_(void) {

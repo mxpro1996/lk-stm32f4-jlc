@@ -4,13 +4,22 @@ name: LK CI (Clang)
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'   # Skip builds when only documentation changes
+      - 'LICENSE'
+      - 'docs/**'
   push:
     branches-ignore:
       - 'wip/**'
       - 'docs/**' # Skip builds for documentation branches
     paths-ignore:
-      - '**.md'   # Skip builds when only markdown files change
-      - 'docs/**' # Skip builds for docs directory changes
+      - '**.md'   # Skip builds when only documentation changes
+      - 'LICENSE'
+      - 'docs/**'
+
+# These jobs only build the tree; they never write back to the repo.
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -30,10 +39,20 @@ jobs:
           # when no usable libgcc is found for the target, so 32-bit targets
           # build fine here too now.
           #
-          # m68k, mips, and or1k are left out: they don't build under Clang
-          # yet (m68k crashes the Clang integrated assembler on inline asm,
-          # mips rejects the -march=m14k CPU name, and or1k's rules.mk
-          # explicitly refuses TOOLCHAIN=clang).
+          # m68k and mips are left out: they don't build under Clang yet
+          # (m68k crashes the Clang integrated assembler on inline asm, and
+          # mips rejects the -march=m14k CPU name).
+          #
+          # The Stellaris Cortex-M boards are left out for a different reason:
+          # their M4F has a single-precision-only FPU, so double math still
+          # lowers to __aeabi_d* calls, and the fallback above covers only
+          # 64-bit divide/mod -- not float. Ubuntu's libclang-rt ships no ARM
+          # baremetal multilib and this image has no cross-GCC, so LIBGCC comes
+          # out empty and those calls go unresolved at link time (on every
+          # Clang version, not just the old one). Building them here would need
+          # either a real arm-none-eabi libgcc installed in the job or soft
+          # float added to lib/libc; a normal build with a proper libgcc is
+          # fine, which is what the GCC matrix already covers.
           - qemu-virt-arm32-test
           - qemu-virt-arm64-test
           - qemu-virt-riscv32-test
@@ -87,7 +106,7 @@ jobs:
       if: ${{ matrix.project == 'qemu-virt-arm64-test' }}
       shell: bash
       run: |
-        env -i DEBIAN_FRONTEND=noninteractive sudo apt-get install -y qemu-system-arm expect
+        env -i DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends qemu-system-arm expect
     - name: uefi unittest
       if: ${{ matrix.project == 'qemu-virt-arm64-test' }}
       shell: bash
@@ -137,7 +156,7 @@ jobs:
     - name: qemu
       shell: bash
       run: |
-        env -i DEBIAN_FRONTEND=noninteractive sudo apt-get install -y qemu-system-arm expect
+        env -i DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends qemu-system-arm expect
 
     - name: uefi unittest
       shell: bash

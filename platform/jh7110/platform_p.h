@@ -9,6 +9,10 @@
 
 #include <stdbool.h>
 
-void uart_init(void);
+// The console uart, as a port number for the dev/uart/dwc8250 driver.
+#define DEBUG_UART 0
+
+void platform_init_uart_early(void);
+void platform_init_uart(void);
 
 

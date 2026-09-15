@@ -16,6 +16,7 @@ MODULE_DEPS += lib/cbuf
 MODULE_DEPS += lib/fdt
 MODULE_DEPS += lib/fdtwalk
 MODULE_DEPS += dev/interrupt/riscv_plic
+MODULE_DEPS += dev/uart/dwc8250
 
 MODULE_SRCS += $(LOCAL_DIR)/platform.c
 MODULE_SRCS += $(LOCAL_DIR)/uart.c

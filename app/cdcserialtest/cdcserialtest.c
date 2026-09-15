@@ -33,7 +33,7 @@ static void cdctest_entry(const struct app_descriptor *app, void *args) {
             thread_sleep(100);
             continue;
         } else if (bytes < 0) {
-            printf("Error reading bytes from CDC Serial: %ld\n", bytes);
+            printf("Error reading bytes from CDC Serial: %zd\n", bytes);
             break;
         }
 

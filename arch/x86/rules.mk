@@ -2,7 +2,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
-MODULE_OPTIONS := extra_warnings
+MODULE_OPTIONS := extra_warnings test
 MODULE_DEPS := lib/fixed_point
 
 # x86 code always runs with the mmu enabled
@@ -40,9 +40,18 @@ endif
 
 SUBARCH_BUILDDIR := $(call TOBUILDDIR,$(SUBARCH_DIR))
 
+# x86 has no static memory size (RAM is discovered at runtime via multiboot/e820).
+# This is a nominal placeholder solely so MEMSIZE is universally defined for
+# preprocessor use (see app/tests/benchmarks.c, lib/heap/test/heap_tests.c) - it is
+# NOT used by the linker (the x86 linker scripts have no %MEMSIZE% token) and must
+# not be read as authoritative. Keep it well above 1MB or x86 test builds silently
+# flip to the small-buffer branch in benchmarks.c.
+MEMSIZE ?= 0x08000000 # 128MB nominal placeholder, not authoritative
+
 GLOBAL_DEFINES += \
 	ARCH_$(SUBARCH)=1 \
 	MEMBASE=$(MEMBASE) \
+	MEMSIZE=$(MEMSIZE) \
 	KERNEL_BASE=$(KERNEL_BASE) \
 	KERNEL_LOAD_OFFSET=$(KERNEL_LOAD_OFFSET) \
 	KERNEL_ASPACE_BASE=$(KERNEL_ASPACE_BASE) \
@@ -71,8 +80,11 @@ MODULE_SRCS += \
 	$(SUBARCH_DIR)/ops.S \
 	$(SUBARCH_DIR)/spinlock.S \
 \
+	$(LOCAL_DIR)/apicid.c \
 	$(LOCAL_DIR)/arch.c \
+	$(LOCAL_DIR)/tlb.c \
 	$(LOCAL_DIR)/cache.c \
+	$(LOCAL_DIR)/clocks.c \
 	$(LOCAL_DIR)/descriptor.c \
 	$(LOCAL_DIR)/faults.c \
 	$(LOCAL_DIR)/feature.c \
@@ -82,6 +94,17 @@ MODULE_SRCS += \
 	$(LOCAL_DIR)/mp.c \
 	$(LOCAL_DIR)/pv.c \
 	$(LOCAL_DIR)/thread.c \
+	$(LOCAL_DIR)/uarch.c \
+
+ifeq ($(SUBARCH),x86-64)
+# the PE/COFF header that makes lk.bin double as a UEFI application, plus the
+# EFI boot stub. The header is inert data on multiboot boots, so it is always
+# built.
+MODULE_SRCS += \
+	$(SUBARCH_DIR)/efi-header.S
+MODULE_DEPS += \
+	$(SUBARCH_DIR)/efi
+endif
 
 # legacy x86's dont have fpu support
 ifneq ($(CPU),legacy)
@@ -155,6 +178,17 @@ CLANG_ARCH_TRIPLE ?= i386-elf
 endif
 
 LINKER_SCRIPT += $(SUBARCH_BUILDDIR)/kernel.ld
+
+ifeq ($(SUBARCH),x86-64)
+# lk.bin already carries a PE/COFF header (arch/x86/64/efi-header.S), so the
+# UEFI application is a plain copy with the conventional extension
+OUTEFI := $(basename $(OUTBIN)).efi
+$(OUTEFI): $(OUTBIN)
+	@echo generating $@
+	$(NOECHO)cp $< $@
+EXTRA_BUILDDEPS += $(OUTEFI)
+GENERATED += $(OUTEFI)
+endif
 
 # potentially generated files that should be cleaned out with clean make rule
 GENERATED += $(SUBARCH_BUILDDIR)/kernel.ld

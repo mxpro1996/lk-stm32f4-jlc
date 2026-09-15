@@ -339,7 +339,7 @@ static ssize_t spiflash_bdev_read_block(struct bdev *device, void *buf,
         status = HAL_QSPI_Command(&qspi_handle, &s_command, HAL_QPSI_TIMEOUT_DEFAULT_VALUE);
         if (status != HAL_OK) {
             retcode = hal_error_to_status(status);
-            dprintf(CRITICAL, "%s: HAL_QSPI_Command failed with err = %ld\n",
+            dprintf(CRITICAL, "%s: HAL_QSPI_Command failed with err = %zd\n",
                     __func__, retcode);
             goto err;
         }
@@ -348,7 +348,7 @@ static ssize_t spiflash_bdev_read_block(struct bdev *device, void *buf,
         status = qspi_rx_dma(&qspi_handle, &s_command, buf);
         if (status != HAL_OK) {
             retcode = hal_error_to_status(status);
-            dprintf(CRITICAL, "%s: qspi_rx_dma failed with err = %ld\n",
+            dprintf(CRITICAL, "%s: qspi_rx_dma failed with err = %zd\n",
                     __func__, retcode);
             goto err;
         }
@@ -378,7 +378,7 @@ static ssize_t spiflash_bdev_write_block(struct bdev *device, const void *_buf,
     for (; count > 0; count--, block++) {
         ssize_t bytes_written = qspi_write_page_unsafe(block * N25QXXA_PAGE_SIZE, buf);
         if (bytes_written < 0) {
-            dprintf(CRITICAL, "%s: qspi_write_page_unsafe failed with err = %ld\n",
+            dprintf(CRITICAL, "%s: qspi_write_page_unsafe failed with err = %zd\n",
                     __func__, bytes_written);
             total_bytes_written = bytes_written;
             goto err;
@@ -595,7 +595,7 @@ status_t qspi_flash_init(size_t flash_size) {
     device_state = QSPI_STATE_COMMAND;
 
     // Initialize the QSPI Flash and register it as a Block I/O device.
-    geometry.erase_size = log2_uint(N25QXXA_SUBSECTOR_SIZE);
+    geometry.erase_size = N25QXXA_SUBSECTOR_SIZE;
     geometry.erase_shift = log2_uint(N25QXXA_SUBSECTOR_SIZE);
     geometry.start = 0;
     geometry.size = flash_size;

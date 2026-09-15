@@ -15,6 +15,7 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <memory>
 #include <string.h>
 
@@ -264,48 +265,6 @@ bool test_fat_utf8_ucs2_roundtrip() {
             hexdump8_ex(reinterpret_cast<const uint8_t *>(utf8_out.get()), utf8_len, 0);
             EXPECT_FALSE(true);
         }
-    }
-
-    END_TEST;
-}
-
-bool test_fat_split_path() {
-    BEGIN_TEST;
-
-    {
-        char path[] = "/foo/bar";
-        const char *leading = nullptr;
-        const char *last = nullptr;
-        split_path(path, &leading, &last);
-        EXPECT_EQ(0, strcmp("/foo", leading));
-        EXPECT_EQ(0, strcmp("bar", last));
-    }
-
-    {
-        char path[] = "foo";
-        const char *leading = nullptr;
-        const char *last = nullptr;
-        split_path(path, &leading, &last);
-        EXPECT_EQ(0, strcmp("/", leading));
-        EXPECT_EQ(0, strcmp("foo", last));
-    }
-
-    {
-        char path[] = "/foo";
-        const char *leading = nullptr;
-        const char *last = nullptr;
-        split_path(path, &leading, &last);
-        EXPECT_EQ(0, strcmp("/", leading));
-        EXPECT_EQ(0, strcmp("foo", last));
-    }
-
-    {
-        char path[] = "/";
-        const char *leading = nullptr;
-        const char *last = nullptr;
-        split_path(path, &leading, &last);
-        EXPECT_EQ(0, strcmp("/", leading));
-        EXPECT_EQ(0, strcmp("", last));
     }
 
     END_TEST;
@@ -821,7 +780,8 @@ bool test_fat_dir_growth() {
             ASSERT_EQ(NO_ERROR, fs_close_file(fh));
         }
 
-        // List the directory and count the entries (should be 1002: 1000 files + . + ..).
+        // List the directory and count the entries. Just the 1000 files: "." and
+        // ".." are on disk but are not part of a listing on any filesystem here.
         dirhandle *dh = nullptr;
         ASSERT_EQ(NO_ERROR, fs_open_dir(dirname, &dh));
         ASSERT_NONNULL(dh);
@@ -831,7 +791,7 @@ bool test_fat_dir_growth() {
             count++;
         }
         ASSERT_EQ(NO_ERROR, fs_close_dir(dh));
-        EXPECT_EQ(1002, count);
+        EXPECT_EQ(1000, count);
 
         // Remove all files.
         for (int i = 0; i < 1000; i++) {
@@ -1016,7 +976,6 @@ RUN_TEST(test_fat_mount)
 RUN_TEST(test_fat_utf8_to_ucs2)
 RUN_TEST(test_fat_ucs2_to_utf8)
 RUN_TEST(test_fat_utf8_ucs2_roundtrip)
-RUN_TEST(test_fat_split_path)
 RUN_TEST(test_fat_name_to_short_file_name)
 RUN_TEST(test_fat_dir_root)
 RUN_TEST(test_fat_read_file)

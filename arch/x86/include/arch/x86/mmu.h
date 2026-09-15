@@ -118,6 +118,9 @@ void x86_mmu_early_init(void);
 void x86_mmu_init(void);
 void x86_mmu_early_init_percpu(void);
 
+/* invalidate the translations of [vaddr, vaddr + count pages) on every cpu */
+void x86_tlb_shootdown(vaddr_t vaddr, uint count);
+
 __END_CDECLS
 
 #endif // !ASSEMBLY

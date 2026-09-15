@@ -26,9 +26,21 @@ __BEGIN_CDECLS
     _val; \
 })
 
+/*
+ * MSR/MRS always transfer all 64 bits of a system register and the assembler
+ * only accepts an X register operand, so there is deliberately no 32 bit
+ * variant of these macros: the "w" constraint selects a vector register and
+ * the %w0 modifier assembles to an invalid instruction. Cast the value here so
+ * that callers passing a 32 bit type still get an x register rather than
+ * tripping clang's -Wasm-operand-widths.
+ *
+ * Note the cast sign extends a signed argument, so a negative 32 bit value
+ * lands as all ones in the upper half. That half is RES0 in every register
+ * written here, but pass an unsigned type if that ever stops being true.
+ */
 #define ARM64_WRITE_SYSREG(reg, val) \
 ({ \
-    __asm__ volatile("msr " TOSTRING(reg) ", %0" :: "r" (val)); \
+    __asm__ volatile("msr " TOSTRING(reg) ", %0" :: "r" ((uint64_t)(val))); \
     ISB; \
 })
 
@@ -53,11 +65,6 @@ struct arm64_iframe_short {
     uint64_t spsr;
 };
 
-struct arm64_stackframe {
-    uint64_t fp;
-    uint64_t pc;
-};
-
 struct thread;
 extern void arm64_exception_table(void);
 void arm64_fpu_exception(struct arm64_iframe_long *iframe);
@@ -72,8 +79,18 @@ static inline void arm64_fpu_pre_context_switch(struct thread *thread) {
     }
 }
 
-/* overridable syscall handler */
+/*
+ * Hooks for exceptions taken from EL0, both overridable (the defaults are weak).
+ * They run in exception context on the thread's kernel stack with interrupts
+ * disabled; returning resumes user space at iframe->elr. The defaults print the
+ * frame and end the thread rather than the kernel.
+ */
 void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit);
+void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far);
+
+/* what the hooks do unless overridden; an override can fall back to these */
+void arm64_syscall_unhandled(struct arm64_iframe_long *iframe, bool is_64bit) __NO_RETURN;
+void arm64_user_exception_unhandled(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) __NO_RETURN;
 
 /* Local per-cpu cache flush routines.
  * These routines clean or invalidate the cache from the point of view

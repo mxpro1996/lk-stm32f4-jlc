@@ -253,20 +253,20 @@ typedef uint64_t pte_t;
 
 __BEGIN_CDECLS
 
-#define ARM64_TLBI_NOADDR(op)            \
-    ({                                   \
-        __asm__ volatile("tlbi " #op::); \
-        ISB;                             \
-    })
+/* Bare TLB invalidates. The caller owns the barriers: dsb ishst before, so the
+ * table write being invalidated is visible to the walkers first, and dsb ish
+ * (plus isb for kernel mappings) after, before anything depends on the entries
+ * being gone. */
+#define ARM64_TLBI_NOADDR(op) __asm__ volatile("tlbi " #op ::: "memory")
+#define ARM64_TLBI(op, val)   __asm__ volatile("tlbi " #op ", %0" ::"r"(val) : "memory")
 
-#define ARM64_TLBI(op, val)                              \
-    ({                                                   \
-        __asm__ volatile("tlbi " #op ", %0" ::"r"(val)); \
-        ISB;                                             \
-    })
-
+/* asid argument to arm64_mmu_map/unmap for the kernel's global mappings, which
+ * carry no asid and are invalidated with the all-asid forms */
 #define MMU_ARM64_GLOBAL_ASID (~0U)
-#define MMU_ARM64_USER_ASID   (0U)
+
+/* base TCR value computed by start.S; MMU_TCR_AS is set in it when the cpu has 16 bit asids */
+extern uint64_t arm64_mmu_tcr_flags;
+
 int arm64_mmu_map(vaddr_t vaddr, paddr_t paddr, size_t size, pte_t attrs,
                   vaddr_t vaddr_base, uint top_size_shift,
                   uint top_index_shift, uint page_size_shift,

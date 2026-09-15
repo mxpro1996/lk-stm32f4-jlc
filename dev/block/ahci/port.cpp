@@ -91,6 +91,10 @@ status_t ahci_port::probe(ahci_disk **found_disk) {
     LTRACEF("allocating %#zx bytes for command list / FIS / command tables\n", size);
 
     // allocate a contiguous block of ram
+    //
+    // Mapped as device memory so that the plain stores below are ordered against the register
+    // writes that hand a command to the controller, without any explicit barriers. See the note
+    // at the top of ahci.cpp for why that only holds on a coherent, non-virtualized x86 host.
     char str[32];
     snprintf(str, sizeof(str), "ahci%d.%u cmd/fis", ahci_.unit_num(), index_);
     status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, size,
@@ -499,5 +503,5 @@ void ahci_port::register_async_callback(uint slot, bio_async_callback_t callback
     async_cmds_[slot].callback_context = callback_context;
     async_cmds_[slot].bytes_to_read_write = bytes_to_transfer;
 
-    LTRACEF("registered async callback for slot %u, %ld bytes\n", slot, bytes_to_transfer);
+    LTRACEF("registered async callback for slot %u, %zd bytes\n", slot, bytes_to_transfer);
 }

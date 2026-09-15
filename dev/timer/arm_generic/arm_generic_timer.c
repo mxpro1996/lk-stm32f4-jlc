@@ -42,6 +42,12 @@
 #define TIMER_REG_CNTV_TVAL cntv_tval_el0
 #define TIMER_REG_CNTVCT    cntvct_el0
 
+/*
+ * The 32/64 in these names refers to the width of the architectural register,
+ * which only changes the access on AArch32 (MCR/MRC vs MCRR/MRRC). On AArch64
+ * every one of these is a 64 bit system register reached with MSR/MRS, so both
+ * forms map to the same accessor here.
+ */
 #define READ_TIMER_REG32(reg)       ARM64_READ_SYSREG(reg)
 #define READ_TIMER_REG64(reg)       ARM64_READ_SYSREG(reg)
 #define WRITE_TIMER_REG32(reg, val) ARM64_WRITE_SYSREG(reg, val)
@@ -149,8 +155,8 @@ static void write_cntp_cval(uint64_t cntp_cval) {
     WRITE_TIMER_REG64(TIMER_REG_CVAL, cntp_cval);
 }
 
-static void write_cntp_tval(int32_t cntp_tval) {
-    LTRACEF_LEVEL(3, "cntp_tval: 0x%08x, %d\n", cntp_tval, cntp_tval);
+static void write_cntp_tval(uint32_t cntp_tval) {
+    LTRACEF_LEVEL(3, "cntp_tval: 0x%08x, %u\n", cntp_tval, cntp_tval);
     WRITE_TIMER_REG32(TIMER_REG_TVAL, cntp_tval);
 }
 

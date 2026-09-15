@@ -18,6 +18,7 @@
 #include <platform.h>
 #include <platform/interrupts.h>
 #include <platform/pc.h>
+#include <platform/pc/hpet.h>
 #include <platform/pc/timer.h>
 #include <platform/timer.h>
 #include <platform/vga_console.h>
@@ -214,6 +215,85 @@ void pit_stop_timer(void) {
     spin_unlock_irqrestore(&lock, state);
 }
 
+// Measure what the PIT's counter is actually clocked at, in Hz.
+//
+// Everything else here takes INTERNAL_FREQ on faith and reports a TSC frequency derived
+// from it, so a PIT ticking at the wrong rate comes back as a wrong TSC frequency with
+// nothing to distinguish it from a correct one. This times a known countdown against the
+// HPET instead, whose frequency is read from its capability register rather than measured,
+// and so answers the question directly: it returns the PIT's rate, not a ratio between two
+// guesses.
+//
+// Runs with interrupts disabled and takes as long as the countdown does -- ~55ms if the
+// counter is ticking at its nominal rate, proportionally longer if it isn't -- so this is
+// for the caltest command, not for anything on the boot path.
+uint64_t pit_measure_freq(void) {
+    DEBUG_ASSERT(arch_ints_disabled());
+
+    const uint64_t hpet_hz = hpet_get_freq();
+    if (hpet_hz == 0) {
+        return 0;
+    }
+
+    // Full 16 bit countdown for the longest window we can get from one shot, which puts
+    // the poll granularity somewhere around 10ppm of the result.
+    const uint16_t count = 0xffff;
+
+    // Mode 0, binary, lsb then msb. The countdown starts on the msb write.
+    outp(I8253_CONTROL_REG, 0x30);
+    outp(I8253_DATA_REG, count & 0xff);
+    outp(I8253_DATA_REG, count >> 8);
+
+    const uint64_t hpet_start = hpet_read_counter();
+
+    // A machine whose PIT never reaches terminal count would otherwise wedge us here with
+    // interrupts off, which is worth guarding against given the whole point of this routine
+    // is to be pointed at a PIT that is behaving oddly.
+    const uint64_t timeout_ticks = hpet_hz * 2;
+
+    uint64_t elapsed;
+    for (;;) {
+        // Read back the status of ch0 and look for bit 7 (output) high, bit 6 (null
+        // count) low.
+        outp(I8253_CONTROL_REG, 0xe2);
+        const uint8_t status = inp(I8253_DATA_REG);
+
+        elapsed = hpet_counter_delta(hpet_start, hpet_read_counter());
+
+        if ((status & 0xc0) == 0x80) {
+            break;
+        }
+
+        if (elapsed > timeout_ticks) {
+            dprintf(INFO, "PIT: counter never reached terminal count, giving up\n");
+            set_pit_frequency(1000);
+            return 0;
+        }
+    }
+
+    if (elapsed == 0) {
+        return 0;
+    }
+
+    // count ticks took elapsed/hpet_hz seconds. count is 16 bits and hpet_hz is tens of
+    // MHz, so the product is nowhere near overflowing.
+    const uint64_t freq = ((uint64_t)count * hpet_hz) / elapsed;
+
+    // nominal/measured, in thousandths. That ratio is exactly the factor by which every
+    // PIT derived measurement is scaled, so it is the number worth printing: 1.000x means
+    // the counter is ticking where it should.
+    const uint64_t ratio_milli = (INTERNAL_FREQ * 1000) / freq;
+    dprintf(INFO,
+            "PIT: input clock measured %" PRIu64 "Hz over %" PRIu64 " hpet ticks (nominal %" PRIu64
+            "Hz, ratio %" PRIu64 ".%03" PRIu64 "x)\n",
+            freq, elapsed, (uint64_t)INTERNAL_FREQ, ratio_milli / 1000, ratio_milli % 1000);
+
+    // put the PIT back to 1ms countdown
+    set_pit_frequency(1000);
+
+    return freq;
+}
+
 uint64_t pit_calibrate_tsc(void) {
     DEBUG_ASSERT(arch_ints_disabled());
 
@@ -246,15 +326,28 @@ uint64_t pit_calibrate_tsc(void) {
         tsc_ticks[i] = tsc_end - tsc_start;
     }
 
-    // find the best time
+    // Each sample carries a roughly fixed error: the window starts before the tsc is
+    // sampled (the countdown is already running once the last port write lands), and it
+    // ends after the countdown expires (the readback poll only notices on its next pass).
+    // Both are close to constant per sample, so they shrink as a fraction of the window as
+    // the window grows -- which makes the longest window the most accurate sample and the
+    // raw-tick comparison this used to do, which always resolved to the *shortest* window,
+    // the least accurate one.
     uint best_index = 0;
-    for (uint i = 1; i < countof(tsc_ticks); i++) {
-        if (tsc_ticks[i] < tsc_ticks[best_index]) {
+    for (uint i = 0; i < countof(tsc_ticks); i++) {
+        const uint64_t implied = (tsc_ticks[i] * 1000) / countdown_ms[i];
+
+        // Print every sample. The trend across them says what any error is: a frequency
+        // that holds steady as the window grows means the PIT is ticking at the wrong rate,
+        // one that drifts means a fixed per-sample cost is being amortized away.
+        dprintf(SPEW, "PIT: sample %u: %ums window, %" PRIu64 " tsc ticks, implies %" PRIu64 "Hz\n",
+                i, countdown_ms[i], tsc_ticks[i], implied);
+
+        if (countdown_ms[i] > countdown_ms[best_index]) {
             best_index = i;
         }
     }
 
-    // calculate the tsc frequency
     tsc_freq = (tsc_ticks[best_index] * 1000) / countdown_ms[best_index];
     dprintf(INFO, "PIT: calibrated TSC frequency: %" PRIu64 "Hz\n", tsc_freq);
 
@@ -295,15 +388,21 @@ uint32_t pit_calibrate_lapic(uint32_t (*lapic_read_tick)(void)) {
         lapic_ticks[i] = tick_start - tick_end;
     }
 
-    // find the best time
+    // Same selection as pit_calibrate_tsc(): the longest window amortizes the fixed
+    // per-sample error best, so take it rather than comparing raw tick counts.
     uint best_index = 0;
-    for (uint i = 1; i < countof(lapic_ticks); i++) {
-        if (lapic_ticks[i] < lapic_ticks[best_index]) {
+    for (uint i = 0; i < countof(lapic_ticks); i++) {
+        const uint32_t implied = (lapic_ticks[i] * 1000) / countdown_ms[i];
+
+        dprintf(SPEW,
+                "PIT: sample %u: %ums window, %" PRIu64 " lapic ticks, implies %" PRIu32 "Hz\n", i,
+                countdown_ms[i], lapic_ticks[i], implied);
+
+        if (countdown_ms[i] > countdown_ms[best_index]) {
             best_index = i;
         }
     }
 
-    // calculate the tsc frequency
     uint32_t freq = (lapic_ticks[best_index] * 1000) / countdown_ms[best_index];
     dprintf(INFO, "PIT: calibrated local apic frequency: %" PRIu32 "Hz\n", freq);
 

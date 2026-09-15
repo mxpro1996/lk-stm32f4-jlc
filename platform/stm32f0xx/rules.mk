@@ -25,6 +25,8 @@ GLOBAL_DEFINES += \
 MEMSIZE ?= 16384
 endif
 
+LK_EMBEDDED := 1
+
 GLOBAL_DEFINES += \
 	USE_STDPERIPH_DRIVER \
 	MEMSIZE=$(MEMSIZE)
@@ -57,6 +59,7 @@ MODULE_DEPS += \
 	platform/stm32f0xx/STM32F0xx_HAL_Driver \
 	arch/arm/arm-m/systick \
 	dev/usb \
-	lib/cbuf
+	lib/cbuf \
+	lib/io
 
 include make/module.mk

@@ -6,6 +6,7 @@
  * https://opensource.org/licenses/MIT
  */
 
+#include <assert.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/pow2.h>
@@ -182,6 +183,26 @@ static spifs_file_t *find_file(spifs_t *spifs, const char *name) {
     return NULL;
 }
 
+// A file is owned by the mount's list, so a vnode over it is just a view and
+// there is nothing to free when the last reference goes away -- hence no
+// release op. The file's address doubles as the identity the layer
+// deduplicates on: the layer refuses to unlink an object anything still
+// references, so an address can only be reused once every vnode naming the
+// old file is gone.
+static uint64_t file_id(spifs_file_t *file) {
+    return (uint64_t)(uintptr_t)file;
+}
+
+// The root is the only directory and carries no private state, so a NULL priv
+// is what tells a directory vnode from a file vnode.
+static spifs_file_t *vnode_file(struct fs_vnode *vn) {
+    return (spifs_file_t *)vn->priv;
+}
+
+static spifs_t *vnode_fs(struct fs_vnode *vn) {
+    return (spifs_t *)vn->cookie;
+}
+
 static uint32_t find_open_run(spifs_t *spifs, uint32_t requested_length) {
     spifs_file_t *file;
     list_for_every_entry(&spifs->files, file, spifs_file_t, node) {
@@ -348,7 +369,7 @@ static void spifs_add_ascending(spifs_t *spifs, spifs_file_t *target) {
 }
 
 static status_t spifs_read_page(spifs_t *spifs, uint32_t page_addr) {
-    off_t block_addr = page_addr * spifs->blocks_per_page;
+    off_t block_addr = (off_t)page_addr * spifs->blocks_per_page;
 
     ssize_t bytes = bio_read_block(spifs->dev, spifs->page, block_addr,
                                    spifs->blocks_per_page);
@@ -361,7 +382,7 @@ static status_t spifs_read_page(spifs_t *spifs, uint32_t page_addr) {
 }
 
 static status_t spifs_write_page(spifs_t *spifs, uint32_t page_addr) {
-    off_t block_addr = page_addr * spifs->blocks_per_page;
+    off_t block_addr = (off_t)page_addr * spifs->blocks_per_page;
     off_t device_addr = block_addr * spifs->dev->block_size;
 
     // Device requires erase before write?
@@ -449,8 +470,9 @@ static status_t get_device_page_info(bdev_t *dev, uint32_t *page_size, uint32_t 
             return NO_ERROR;
         }
         case 1: {
-            // Device has erase geometry.
-            size_t erase_size = valpow2(dev->geometry->erase_size);
+            // Device has erase geometry. erase_size is in bytes, per lib/bio.h;
+            // erase_shift is the log2 of it.
+            size_t erase_size = dev->geometry->erase_size;
             size_t block_size = dev->block_size;
 
             if (erase_size % block_size != 0) {
@@ -578,7 +600,8 @@ err:
     return err;
 }
 
-static status_t spifs_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options) {
+static status_t spifs_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,
+                            struct fs_vnode **root) {
     if (options != 0) {
         return ERR_INVALID_ARGS;
     }
@@ -673,6 +696,12 @@ static status_t spifs_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_option
         goto err;
     }
 
+    // last fallible step, so the unwind below never has a vnode to dispose of
+    status = fs_vnode_create(0, FS_VNODE_DIR, NULL, root);
+    if (status != NO_ERROR) {
+        goto err;
+    }
+
     *cookie = (fscookie *)spifs;
 
     return NO_ERROR;
@@ -692,6 +721,9 @@ static status_t spifs_unmount(fscookie *cookie) {
 
     spifs_t *spifs = (spifs_t *)cookie;
 
+    // the layer only unmounts once every handle is closed
+    DEBUG_ASSERT(list_is_empty(&spifs->dcookies));
+
     mutex_acquire(&spifs->lock);
 
     spifs_file_t *file;
@@ -708,20 +740,33 @@ static status_t spifs_unmount(fscookie *cookie) {
     return NO_ERROR;
 }
 
-static status_t spifs_create(fscookie *cookie, const char *name, filecookie **fcookie, uint64_t len) {
+static status_t spifs_lookup(struct fs_vnode *dir, const char *name, struct fs_vnode **out) {
+    spifs_t *spifs = vnode_fs(dir);
+
+    LTRACEF("dir %p name '%s'\n", dir, name);
+
+    DEBUG_ASSERT(dir->type == FS_VNODE_DIR);
+
+    mutex_acquire(&spifs->lock);
+    spifs_file_t *file = find_file(spifs, name);
+    mutex_release(&spifs->lock);
+
+    if (!file) {
+        return ERR_NOT_FOUND;
+    }
+
+    return fs_vnode_create(file_id(file), FS_VNODE_FILE, file, out);
+}
+
+static status_t spifs_create(struct fs_vnode *dir, const char *name, uint64_t len,
+                             struct fs_vnode **out) {
     status_t status = NO_ERROR;
 
-    LTRACEF("cookie %p name '%s' filecookie %p len %llu\n", cookie, name, fcookie, len);
+    LTRACEF("dir %p name '%s' len %llu\n", dir, name, len);
 
-    spifs_t *spifs = (spifs_t *)cookie;
+    spifs_t *spifs = vnode_fs(dir);
 
-    // Strip leading fwd-slashes
-    name = trim_name(name);
-
-    // File system is flat, directories not supported.
-    if (strchr(name, '/')) {
-        return ERR_NOT_SUPPORTED;
-    }
+    DEBUG_ASSERT(dir->type == FS_VNODE_DIR);
 
     // Check that filename is not too long.
     if (strnlen(name, MAX_FILENAME_LENGTH) == MAX_FILENAME_LENGTH) {
@@ -774,10 +819,20 @@ static status_t spifs_create(fscookie *cookie, const char *name, filecookie **fc
     memset(file->metadata.filename, 0, MAX_FILENAME_LENGTH);
     strlcpy(file->metadata.filename, name, MAX_FILENAME_LENGTH);
 
+    status = fs_vnode_create(file_id(file), FS_VNODE_FILE, file, out);
+    if (status != NO_ERROR) {
+        free(file);
+        goto err;
+    }
+
     // Erase the memory allocated to the file.
-    if (bio_erase(spifs->dev, open_run * spifs->page_size, capacity) !=
+    // cast before the multiply: open_run and page_size are both 32 bits, so the
+    // product wraps before it is widened to the off_t bio_erase() takes.
+    // spifs_write_page() already computes its device address this way.
+    if (bio_erase(spifs->dev, (off_t)open_run * spifs->page_size, capacity) !=
         (ssize_t)capacity) {
 
+        fs_vnode_destroy(*out);
         free(file);
 
         status = ERR_IO;
@@ -790,14 +845,12 @@ static status_t spifs_create(fscookie *cookie, const char *name, filecookie **fc
         // If the commit fails, make sure we don't leave any residue of the file
         // lying around.
         list_delete(&file->node);
+        fs_vnode_destroy(*out);
         free(file);
-        *fcookie = NULL;
 
         status = ERR_IO;
         goto err;
     }
-
-    *fcookie = (filecookie *)file;
 
 err:
     mutex_release(&spifs->lock);
@@ -805,54 +858,18 @@ err:
     return status;
 }
 
-static status_t spifs_open(fscookie *cookie, const char *name, filecookie **fcookie) {
-    LTRACEF("cookie %p name '%s' filecookie %p\n", cookie, name, fcookie);
-
-    spifs_t *spifs = (spifs_t *)cookie;
-
-    name = trim_name(name);
-
-    mutex_acquire(&spifs->lock);
-
-    spifs_file_t *file = find_file(spifs, name);
-
-    mutex_release(&spifs->lock);
-
-    if (!file) {
-        return ERR_NOT_FOUND;
-    }
-
-    *fcookie = (filecookie *)file;
-
-    return NO_ERROR;
-}
-
-static status_t spifs_close(filecookie *fcookie) {
-    spifs_file_t *file = (spifs_file_t *)fcookie;
-
-    LTRACEF("cookie %p name '%s'\n", fcookie, file->metadata.filename);
-
-    return NO_ERROR;
-}
-
-static status_t spifs_remove(fscookie *cookie, const char *name) {
+// the layer has already refused this if anything still holds the file open
+static status_t spifs_unlink(struct fs_vnode *dir, const char *name, struct fs_vnode *child) {
     status_t status;
 
-    LTRACEF("cookie %p name '%s'\n", cookie, name);
+    LTRACEF("dir %p name '%s'\n", dir, name);
 
-    spifs_t *spifs = (spifs_t *)cookie;
+    spifs_t *spifs = vnode_fs(dir);
+    spifs_file_t *file = vnode_file(child);
 
-    // make sure we strip out any leading /
-    name = trim_name(name);
+    DEBUG_ASSERT(file);
 
     mutex_acquire(&spifs->lock);
-
-    spifs_file_t *file = find_file(spifs, name);
-
-    if (!file) {
-        status = ERR_NOT_FOUND;
-        goto err;
-    }
 
     // Make sure there are no dirents open that point to the file that we're
     // deleting.
@@ -870,16 +887,18 @@ static status_t spifs_remove(fscookie *cookie, const char *name) {
 
     status = spifs_commit_toc(spifs);
 
-err:
     mutex_release(&spifs->lock);
 
     return status;
 }
 
-static ssize_t spifs_read(filecookie *fcookie, void *buf, off_t off, size_t len) {
-    LTRACEF("filecookie %p buf %p offset %lld len %zu\n", fcookie, buf, off, len);
+static ssize_t spifs_read(struct fs_vnode *vn, void *buf, off_t off, size_t len) {
+    LTRACEF("vnode %p buf %p offset %lld len %zu\n", vn, buf, off, len);
 
-    spifs_file_t *file = (spifs_file_t *)fcookie;
+    spifs_file_t *file = vnode_file(vn);
+    if (!file) {
+        return ERR_NOT_FILE;
+    }
     spifs_t *spifs = file->fs_handle;
 
     if (off < 0) {
@@ -888,16 +907,18 @@ static ssize_t spifs_read(filecookie *fcookie, void *buf, off_t off, size_t len)
 
     mutex_acquire(&spifs->lock);
 
-    uint32_t file_start = file->fs_handle->page_size * file->metadata.page_idx;
-    uint32_t file_end = file_start + file->metadata.length;
+    // cast before the multiply: page_size and page_idx are both 32 bits, so the
+    // product wraps before it is widened to the off_t bio_read() takes.
+    const off_t file_start = (off_t)file->fs_handle->page_size * file->metadata.page_idx;
+    const off_t file_end = file_start + file->metadata.length;
 
-    uint32_t read_start = file_start + off;
-    uint32_t read_end = read_start + len;
+    const off_t read_start = file_start + off;
+    const off_t read_end = read_start + (off_t)len;
 
     if (read_start >= file_end) {
         len = 0;
     } else if (read_end > file_end) {
-        len = file_end - read_start;
+        len = (size_t)(file_end - read_start);
     }
 
     DEBUG_ASSERT(file->fs_handle->dev);
@@ -909,14 +930,17 @@ static ssize_t spifs_read(filecookie *fcookie, void *buf, off_t off, size_t len)
     return result;
 }
 
-static ssize_t spifs_write(filecookie *fcookie, const void *buf, off_t off, size_t size) {
+static ssize_t spifs_write(struct fs_vnode *vn, const void *buf, off_t off, size_t size) {
     status_t err = NO_ERROR;
     size_t len = size;
 
-    LTRACEF("filecookie %p buf %p offset %lld len %zu\n", fcookie, buf, off, len);
+    LTRACEF("vnode %p buf %p offset %lld len %zu\n", vn, buf, off, len);
 
-    spifs_file_t *file = (spifs_file_t *)fcookie;
-    spifs_t *spifs = (spifs_t *)(file->fs_handle);
+    spifs_file_t *file = vnode_file(vn);
+    if (!file) {
+        return ERR_NOT_FILE;
+    }
+    spifs_t *spifs = file->fs_handle;
 
     if (off < 0) {
         return ERR_INVALID_ARGS;
@@ -931,11 +955,14 @@ static ssize_t spifs_write(filecookie *fcookie, const void *buf, off_t off, size
 
     bool dirty_toc = false;
 
-    uint32_t start_addr =
-        off + (file->metadata.page_idx * spifs->page_size);
+    // cast before the multiply, as in spifs_read(): the 32 bit product wraps on
+    // a device larger than 4GB. The page id and the offset within a page both
+    // stay 32 bit, since page_count is.
+    const off_t start_addr =
+        off + ((off_t)file->metadata.page_idx * spifs->page_size);
 
     uint32_t page_shift = log2_uint(spifs->page_size);
-    uint32_t target_page_id = divpow2(start_addr, page_shift);
+    uint32_t target_page_id = (uint32_t)(start_addr >> page_shift);
 
     // Are we growing the file?
     if (off + len > file->metadata.length) {
@@ -944,11 +971,11 @@ static ssize_t spifs_write(filecookie *fcookie, const void *buf, off_t off, size
     }
 
     // Leading Partial Page.
-    uint32_t page_offset = start_addr % spifs->page_size;
+    uint32_t page_offset = (uint32_t)start_addr & (spifs->page_size - 1);
     if (page_offset) {
-        uint32_t page_end = ROUNDUP(start_addr, spifs->page_size);
-
-        uint32_t n_bytes = MIN(len, page_end - start_addr);
+        // the rest of this page, which is what ROUNDUP(start_addr) - start_addr
+        // comes to whenever page_offset is non-zero
+        uint32_t n_bytes = MIN(len, spifs->page_size - page_offset);
 
         // read..
         err = spifs_read_page(spifs, target_page_id);
@@ -1012,16 +1039,19 @@ err:
     return len == 0 ? (ssize_t)size : err;
 }
 
-static status_t spifs_truncate(filecookie *fcookie, uint64_t len) {
-    LTRACEF("filecookie %p, len %llu\n", fcookie, len);
+static status_t spifs_truncate(struct fs_vnode *vn, uint64_t len) {
+    LTRACEF("vnode %p, len %llu\n", vn, len);
 
     status_t rc = NO_ERROR;
 
-    spifs_file_t *file = (spifs_file_t *)fcookie;
+    spifs_file_t *file = vnode_file(vn);
+    if (!file) {
+        return ERR_NOT_FILE;
+    }
 
-    mutex_acquire(&file->fs_handle->lock);
+    spifs_t *spifs = file->fs_handle;
 
-    spifs_t *spifs = (spifs_t *)(file->fs_handle);
+    mutex_acquire(&spifs->lock);
 
     // Can't use truncate to grow a file.
     if (len > file->metadata.length) {
@@ -1034,39 +1064,40 @@ static status_t spifs_truncate(filecookie *fcookie, uint64_t len) {
     rc = spifs_commit_toc(spifs);
 
 finish:
-    mutex_release(&file->fs_handle->lock);
+    mutex_release(&spifs->lock);
 
     return rc;
 }
 
-static status_t spifs_stat(filecookie *fcookie, struct file_stat *stat) {
-    LTRACEF("filecookie %p stat %p\n", fcookie, stat);
+static status_t spifs_stat(struct fs_vnode *vn, struct file_stat *stat) {
+    LTRACEF("vnode %p stat %p\n", vn, stat);
 
-    spifs_file_t *file = (spifs_file_t *)fcookie;
+    spifs_file_t *file = vnode_file(vn);
+    if (!file) {
+        // the root directory, which has no on-disk entry of its own
+        stat->is_dir = true;
+        stat->size = 0;
+        stat->capacity = 0;
+        return NO_ERROR;
+    }
 
     mutex_acquire(&file->fs_handle->lock);
 
-    if (stat) {
-        stat->is_dir = false;
-        stat->size = file->metadata.length;
-        stat->capacity = file->metadata.capacity;
-    }
+    stat->is_dir = false;
+    stat->size = file->metadata.length;
+    stat->capacity = file->metadata.capacity;
 
     mutex_release(&file->fs_handle->lock);
 
     return NO_ERROR;
 }
 
-static status_t spifs_opendir(fscookie *cookie, const char *name, dircookie **dcookie) {
-    LTRACEF("cookie %p name '%s' dircookie %p\n", cookie, name, dcookie);
+static status_t spifs_opendir(struct fs_vnode *vn, dircookie **dcookie) {
+    LTRACEF("vnode %p dircookie %p\n", vn, dcookie);
 
-    spifs_t *spifs = (spifs_t *)cookie;
+    spifs_t *spifs = vnode_fs(vn);
 
-    name = trim_name(name);
-
-    if (strcmp("", name)) {
-        return ERR_NOT_FOUND;
-    }
+    DEBUG_ASSERT(vn->type == FS_VNODE_DIR);
 
     dircookie *dir = malloc(sizeof(*dir));
     if (!dir) {
@@ -1141,8 +1172,8 @@ static status_t spifs_fs_stat(fscookie *cookie, struct fs_stat *stat) {
     return NO_ERROR;
 }
 
-static status_t spifs_ioctl_get_file_addr(filecookie *cookie, void **argp) {
-    LTRACEF("cookie %p, argp %p\n", cookie, argp);
+static status_t spifs_ioctl_get_file_addr(spifs_file_t *file, void **argp) {
+    LTRACEF("file %p, argp %p\n", file, argp);
 
     if (unlikely(!argp)) {
         return ERR_INVALID_ARGS;
@@ -1150,7 +1181,6 @@ static status_t spifs_ioctl_get_file_addr(filecookie *cookie, void **argp) {
 
     status_t result;
 
-    spifs_file_t *file = (spifs_file_t *)cookie;
     spifs_t *spifs = file->fs_handle;
     bdev_t *dev = spifs->dev;
 
@@ -1168,14 +1198,13 @@ static status_t spifs_ioctl_get_file_addr(filecookie *cookie, void **argp) {
     return NO_ERROR;
 }
 
-static status_t spifs_ioctl_is_linear(filecookie *cookie, void **argp) {
-    LTRACEF("cookie %p, argp %p\n", cookie, argp);
+static status_t spifs_ioctl_is_linear(spifs_file_t *file, void **argp) {
+    LTRACEF("file %p, argp %p\n", file, argp);
 
     if (unlikely(!argp)) {
         return ERR_INVALID_ARGS;
     }
 
-    spifs_file_t *file = (spifs_file_t *)cookie;
     spifs_t *spifs = file->fs_handle;
     bdev_t *dev = spifs->dev;
 
@@ -1188,15 +1217,20 @@ static status_t spifs_ioctl_is_linear(filecookie *cookie, void **argp) {
     return NO_ERROR;
 }
 
-static status_t spifs_file_ioctl(filecookie *cookie, int request, void *argp) {
+static status_t spifs_file_ioctl(struct fs_vnode *vn, int request, void *argp) {
     LTRACEF("request %d, argp %p\n", request, argp);
+
+    spifs_file_t *file = vnode_file(vn);
+    if (!file) {
+        return ERR_NOT_FILE;
+    }
 
     switch (request) {
         case FS_IOCTL_GET_FILE_ADDR: {
-            return spifs_ioctl_get_file_addr(cookie, (void **)argp);
+            return spifs_ioctl_get_file_addr(file, (void **)argp);
         }
         case FS_IOCTL_IS_LINEAR: {
-            return spifs_ioctl_is_linear(cookie, (void **)argp);
+            return spifs_ioctl_is_linear(file, (void **)argp);
         }
         default: {
             return ERR_NOT_SUPPORTED;
@@ -1212,10 +1246,9 @@ static const struct fs_api spifs_api = {
     .mount = spifs_mount,
     .unmount = spifs_unmount,
 
+    .lookup = spifs_lookup,
     .create = spifs_create,
-    .open = spifs_open,
-    .remove = spifs_remove,
-    .close = spifs_close,
+    .unlink = spifs_unlink,
 
     .read = spifs_read,
     .write = spifs_write,
@@ -1223,7 +1256,7 @@ static const struct fs_api spifs_api = {
 
     .stat = spifs_stat,
 
-    .file_ioctl = spifs_file_ioctl,
+    .ioctl = spifs_file_ioctl,
 
     .opendir = spifs_opendir,
     .readdir = spifs_readdir,

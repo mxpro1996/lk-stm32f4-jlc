@@ -52,7 +52,7 @@ EfiStatus read_blocks(EfiBlockIoProtocol *self, uint32_t media_id, uint64_t lba,
       call_with_stack(interface->io_stack, bio_read_block, dev, buffer, lba,
                       buffer_size / dev->block_size);
   if (bytes_read != buffer_size) {
-    printf("Failed to read %ld bytes from %s\n", buffer_size, dev->name);
+    printf("Failed to read %zu bytes from %s\n", buffer_size, dev->name);
     return EFI_STATUS_DEVICE_ERROR;
   }
   return EFI_STATUS_SUCCESS;

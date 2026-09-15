@@ -5,6 +5,15 @@
  * license that can be found in the LICENSE file or at
  * https://opensource.org/licenses/MIT
  */
+
+/*
+ * NOTE: this module does not currently build and is not referenced by any
+ * project. The flash_nor API it was written against no longer exists in the
+ * tree. See TODO.md in this directory for the details and a sketch of the port
+ * onto lib/bio that would make it buildable and testable again.
+ */
+
+#include <assert.h>
 #include <dev/flash_nor.h>
 #include <lib/norfs.h>
 #include <lib/norfs_inode.h>
@@ -206,9 +215,10 @@ status_t norfs_read_obj_iovec(uint32_t key, iovec_t *obj_iov,
     uint8_t i = 0;
     ssize_t iov_size = iovec_size(obj_iov, iov_count);
 
-    if (bytes_read) {
-        *bytes_read = 0;
-    }
+    // bytes_read is a required out parameter; the read loop below dereferences
+    // it unconditionally.
+    DEBUG_ASSERT(bytes_read);
+    *bytes_read = 0;
 
     if (!get_inode(key, &inode)) {
         return ERR_NOT_FOUND;
@@ -236,9 +246,7 @@ status_t norfs_read_obj_iovec(uint32_t key, iovec_t *obj_iov,
             TRACEF("Read failed with error: %d\n", bytes);
             return bytes;
         }
-        if (bytes_read) {
-            *bytes_read += bytes;
-        }
+        *bytes_read += bytes;
         i++;
     }
 

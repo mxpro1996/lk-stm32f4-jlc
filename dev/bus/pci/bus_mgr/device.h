@@ -10,16 +10,19 @@
 #include <sys/types.h>
 #include <dev/bus/pci.h>
 #include <lk/cpp.h>
+#include <lktl/list.h>
 #include <lk/err.h>
 #include <lk/list.h>
 
 namespace pci {
 
+class resource_allocator;
+
 class bus;
 struct capability;
 
 // generic pci device
-class device {
+class device : public lk::list_hook<> {
 public:
     device(pci_location_t loc, bus *bus);
     virtual ~device();
@@ -76,9 +79,12 @@ public:
 
         void dump();
     };
-    virtual status_t get_bar_alloc_requests(list_node *bar_alloc_requests);
+    // carve out of the allocator whatever firmware already assigned to this device
+    virtual status_t reserve_assigned_resources(resource_allocator &allocator);
+    // build the list of allocations this device still needs
+    virtual status_t get_bar_alloc_requests(list_node *bar_alloc_requests, pci_assign_mode mode);
     virtual status_t assign_resource(bar_alloc_request *request, uint64_t address);
-    virtual status_t assign_child_resources() { return NO_ERROR; }
+    virtual status_t assign_child_resources(pci_assign_mode mode) { return NO_ERROR; }
 
     pci_location_t loc() const { return loc_; }
     const bus *get_bus() const { return bus_; }
@@ -108,10 +114,6 @@ protected:
     bus *parent_bus() const { return bus_; }
 
 private:
-    // let the bus device directly manipulate our list node
-    friend class bus;
-    list_node node = LIST_INITIAL_CLEARED_VALUE;
-
     pci_location_t loc_ = {};
     bus *bus_ = nullptr;
 
@@ -124,7 +126,6 @@ private:
     capability *msix_cap_ = nullptr;
 
     // MSI-X saved details
-    uint32_t msix_table_size = {};
     void *msix_table_map = nullptr;
     void *msix_pba_map = nullptr;
     volatile uint32_t *msix_table_ptr = nullptr;

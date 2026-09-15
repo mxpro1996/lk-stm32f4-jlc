@@ -7,6 +7,7 @@
  */
 
 #include "ext2_priv.h"
+#include <kernel/mutex.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
@@ -14,66 +15,6 @@
 #include <string.h>
 
 #define LOCAL_TRACE 0
-
-int ext2_open_file(fscookie *cookie, const char *path, filecookie **fcookie) {
-    ext2_t *ext2 = (ext2_t *)cookie;
-    int err;
-
-    /* do a path lookup */
-    inodenum_t inum;
-    err = ext2_lookup(ext2, path, &inum);
-    if (err < 0) {
-        return err;
-    }
-
-    /* create the file object */
-    ext2_file_t *file = malloc(sizeof(ext2_file_t));
-    memset(file, 0, sizeof(ext2_file_t));
-
-    /* read in the inode */
-    err = ext2_load_inode(ext2, inum, &file->inode);
-    if (err < 0) {
-        free(file);
-        return err;
-    }
-
-    file->ext2 = ext2;
-    *fcookie = (filecookie *)file;
-
-    return 0;
-}
-
-ssize_t ext2_read_file(filecookie *fcookie, void *buf, off_t offset, size_t len) {
-    ext2_file_t *file = (ext2_file_t *)fcookie;
-    int err;
-
-    // test that it's a file
-    if (!S_ISREG(file->inode.i_mode)) {
-        dprintf(INFO, "ext2_read_file: not a file\n");
-        return -1;
-    }
-
-    // read from the inode
-    err = ext2_read_inode(file->ext2, &file->inode, buf, offset, len);
-
-    return err;
-}
-
-int ext2_close_file(filecookie *fcookie) {
-    ext2_file_t *file = (ext2_file_t *)fcookie;
-
-    // see if we need to free any of the cache blocks
-    int i;
-    for (i = 0; i < 3; i++) {
-        if (file->ind_cache[i].num != 0) {
-            free(file->ind_cache[i].ptr);
-        }
-    }
-
-    free(file);
-
-    return 0;
-}
 
 off_t ext2_file_len(ext2_t *ext2, struct ext2_inode *inode) {
     /* calculate the file size */
@@ -86,41 +27,73 @@ off_t ext2_file_len(ext2_t *ext2, struct ext2_inode *inode) {
     return len;
 }
 
-int ext2_stat_file(filecookie *fcookie, struct file_stat *stat) {
-    ext2_file_t *file = (ext2_file_t *)fcookie;
+ssize_t ext2_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len) {
+    ext2_vnode_t *v = vn->priv;
 
-    stat->size = ext2_file_len(file->ext2, &file->inode);
-
-    /* is it a dir? */
-    stat->is_dir = false;
-    if (S_ISDIR(file->inode.i_mode)) {
-        stat->is_dir = true;
+    /* only regular files have contents that can be read this way */
+    if (!S_ISREG(v->inode.i_mode)) {
+        return ERR_NOT_FILE;
     }
 
-    return 0;
+    /* negative offsets are invalid */
+    if (offset < 0) {
+        return ERR_INVALID_ARGS;
+    }
+
+    mutex_acquire(&v->ext2->lock);
+    ssize_t ret = ext2_read_inode(v->ext2, &v->inode, buf, offset, len);
+    mutex_release(&v->ext2->lock);
+
+    return ret;
 }
 
-int ext2_read_link(ext2_t *ext2, struct ext2_inode *inode, char *str, size_t len) {
-    LTRACEF("inode %p, str %p, len %zu\n", inode, str, len);
+/* No lock: the inode is held by value and the filesystem is read-only, so
+ * nothing here reaches the block cache. */
+status_t ext2_stat(struct fs_vnode *vn, struct file_stat *stat) {
+    ext2_vnode_t *v = vn->priv;
 
-    off_t linklen = ext2_file_len(ext2, inode);
+    stat->size = ext2_file_len(v->ext2, &v->inode);
+    stat->is_dir = S_ISDIR(v->inode.i_mode);
 
-    if ((linklen < 0) || (linklen + 1 > (off_t)len)) {
-        return ERR_NO_MEMORY;
+    return NO_ERROR;
+}
+
+/* Read a symlink target. Short targets live inline in the inode's block
+ * pointer array, longer ones in the file's data blocks -- and only that longer
+ * case reaches the block cache, so it is the only one that takes the lock. */
+ssize_t ext2_readlink(struct fs_vnode *vn, char *buf, size_t len) {
+    ext2_vnode_t *v = vn->priv;
+
+    LTRACEF("inode %u, buf %p, len %zu\n", v->inum, buf, len);
+
+    if (!S_ISLNK(v->inode.i_mode)) {
+        return ERR_NOT_FILE;
     }
 
-    if (linklen > 60) {
-        int err = ext2_read_inode(ext2, inode, str, 0, linklen);
+    off_t linklen = ext2_file_len(v->ext2, &v->inode);
+    if (linklen < 0) {
+        return ERR_NOT_VALID;
+    }
+    if (linklen + 1 > (off_t)len) {
+        return ERR_NOT_ENOUGH_BUFFER;
+    }
+
+    if (linklen > (off_t)sizeof(v->inode.i_block)) {
+        mutex_acquire(&v->ext2->lock);
+        ssize_t err = ext2_read_inode(v->ext2, &v->inode, buf, 0, linklen);
+        mutex_release(&v->ext2->lock);
         if (err < 0) {
             return err;
         }
-        str[linklen] = 0;
+        if (err != linklen) {
+            return ERR_IO;
+        }
     } else {
-        memcpy(str, &inode->i_block[0], linklen);
-        str[linklen] = 0;
+        memcpy(buf, &v->inode.i_block[0], linklen);
     }
+    buf[linklen] = 0;
 
-    LTRACEF("read link '%s'\n", str);
+    LTRACEF("read link '%s'\n", buf);
 
     return linklen;
 }

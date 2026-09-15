@@ -1,90 +1,61 @@
 /*
- * Copyright (c) 2018 Travis Geiselbrecht
+ * Copyright (c) 2026 Travis Geiselbrecht
  *
  * Use of this source code is governed by a MIT-style
  * license that can be found in the LICENSE file or at
  * https://opensource.org/licenses/MIT
  */
-#include <lk/reg.h>
-#include <lk/trace.h>
-#include <lib/cbuf.h>
-#include <kernel/thread.h>
-#include <platform.h>
-#include <platform/interrupts.h>
+#include <dev/uart.h>
+#include <dev/uart/dwc8250.h>
 #include <platform/debug.h>
 #include <platform/virt.h>
-#include <sys/types.h>
 
 #include "platform_p.h"
 
-// simple 16550 driver for the emulated serial port on qemu riscv virt machine
+static const struct dwc8250_config uart_config = {
+    .base = UART0_BASE_VIRT,
+    .irq = IRQ_UART0,
+    .flag = 0,
+    .reg_style = DWC8250_REG_8,
+};
 
-static volatile uint8_t *const uart_base = (uint8_t *)UART0_BASE_VIRT;
-
-#define RXBUF_SIZE 128
-static char uart_rx_buf_data[RXBUF_SIZE];
-static cbuf_t uart_rx_buf;
-
-static inline uint8_t uart_read_8(size_t offset) {
-    return uart_base[offset];
+void platform_init_uart_early(void) {
+    dwc8250_init_early(DEBUG_UART, &uart_config);
 }
 
-static inline void uart_write_8(size_t offset, uint8_t val) {
-    uart_base[offset] = val;
-}
-
-static enum handler_return uart_irq_handler(void *arg) {
-    unsigned char c;
-    bool resched = false;
-
-    while (uart_read_8(5) & (1<<0)) {
-        c = uart_read_8(0);
-        cbuf_write_char(&uart_rx_buf, c, false);
-        resched = true;
-    }
-
-    return resched ? INT_RESCHEDULE : INT_NO_RESCHEDULE;
-}
-
-void uart_init(void) {
-    /* finish uart init to get rx going */
-    cbuf_initialize_etc(&uart_rx_buf, RXBUF_SIZE, uart_rx_buf_data);
-
-    register_int_handler(IRQ_UART0, uart_irq_handler, NULL);
-
-    uart_write_8(1, 0x1); // enable receive data available interrupt
-
-    unmask_interrupt(IRQ_UART0);
-}
-
-static void uart_putc(char c) {
-    while ((uart_read_8(5) & (1<<6)) == 0)
-        ;
-    uart_write_8(0, c);
-}
-
-static int uart_getc(char *c, bool wait) {
-    return cbuf_read_char(&uart_rx_buf, c, wait);
+void platform_init_uart(void) {
+    dwc8250_init(DEBUG_UART);
 }
 
 void platform_dputc(char c) {
-    if (c == '\n')
-        platform_dputc('\r');
-    uart_putc(c);
+    if (c == '\n') {
+        uart_putc(DEBUG_UART, '\r');
+    }
+    uart_putc(DEBUG_UART, c);
 }
 
 int platform_dgetc(char *c, bool wait) {
-    int ret = uart_getc(c, wait);
-
-    return ret;
+    int ret = uart_getc(DEBUG_UART, wait);
+    if (ret < 0) {
+        return ret;
+    }
+    *c = ret;
+    return 0;
 }
 
 /* panic-time getc/putc */
-int platform_pgetc(char *c, bool wait) {
-    if (uart_read_8(5) & (1<<0)) {
-        *c = uart_read_8(0);
-        return 0;
+void platform_pputc(char c) {
+    if (c == '\n') {
+        uart_pputc(DEBUG_UART, '\r');
     }
-    return -1;
+    uart_pputc(DEBUG_UART, c);
 }
 
+int platform_pgetc(char *c, bool wait) {
+    int ret = uart_pgetc(DEBUG_UART);
+    if (ret < 0) {
+        return ret;
+    }
+    *c = ret;
+    return 0;
+}

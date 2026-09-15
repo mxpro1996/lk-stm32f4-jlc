@@ -11,4 +11,6 @@ MODULE_DEPS := \
     lib/minip \
     lib/version
 
+MODULE_DEPS += lib/lktl
+
 include make/module.mk

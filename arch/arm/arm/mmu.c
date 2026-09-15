@@ -208,7 +208,7 @@ void arm_mmu_init(void) {
 #endif
 }
 
-void arch_mmu_context_switch(arch_aspace_t *aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
     if (LOCAL_TRACE && TRACE_CONTEXT_SWITCH)
         LTRACEF("aspace %p\n", aspace);
 
@@ -234,8 +234,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, ui
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(arch_mmu_is_valid_vaddr(aspace, vaddr));
-    if (!arch_mmu_is_valid_vaddr(aspace, vaddr))
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, 1))
         return ERR_OUT_OF_RANGE;
 
     /* Get the index into the translation table */
@@ -479,8 +478,7 @@ int arch_mmu_map(arch_aspace_t *aspace, addr_t vaddr, paddr_t paddr, uint count,
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(arch_mmu_is_valid_vaddr(aspace, vaddr));
-    if (!arch_mmu_is_valid_vaddr(aspace, vaddr))
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count))
         return ERR_OUT_OF_RANGE;
 
 #if !WITH_ARCH_MMU_PICK_SPOT
@@ -575,9 +573,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(arch_mmu_is_valid_vaddr(aspace, vaddr));
-
-    if (!arch_mmu_is_valid_vaddr(aspace, vaddr))
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count))
         return ERR_OUT_OF_RANGE;
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(vaddr));

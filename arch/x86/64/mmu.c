@@ -95,11 +95,6 @@ static bool x86_mmu_check_paddr(const paddr_t paddr) {
     return paddr <= max_paddr;
 }
 
-/* is the address within the aspace */
-static bool is_valid_vaddr(const arch_aspace_t *aspace, vaddr_t vaddr) {
-    return (vaddr >= aspace->base && vaddr <= aspace->base + aspace->size - 1);
-}
-
 static inline uint64_t get_pfn_from_pte(uint64_t pte) {
     uint64_t pfn = (pte & (X86_PG_FRAME & X86_PHY_ADDR_MASK));
     return pfn;
@@ -564,15 +559,22 @@ int arch_mmu_unmap(arch_aspace_t *const aspace, const vaddr_t vaddr, const uint 
 
     DEBUG_ASSERT(aspace);
 
-    if (!is_valid_vaddr(aspace, vaddr)) {
-        return ERR_INVALID_ARGS;
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
     }
 
     if (count == 0) {
         return NO_ERROR;
     }
 
-    return (x86_mmu_unmap(aspace->cr3, vaddr, count));
+    status_t err = x86_mmu_unmap(aspace->cr3, vaddr, count);
+    if (err < 0) {
+        return err;
+    }
+
+    /* the unmap only invalidated this cpu's translations */
+    x86_tlb_shootdown(vaddr, count);
+    return NO_ERROR;
 }
 
 /**
@@ -625,8 +627,8 @@ status_t arch_mmu_query(arch_aspace_t *const aspace, const vaddr_t vaddr, paddr_
         return ERR_INVALID_ARGS;
     }
 
-    if (!is_valid_vaddr(aspace, vaddr)) {
-        return ERR_INVALID_ARGS;
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, 1)) {
+        return ERR_OUT_OF_RANGE;
     }
 
     arch_flags_t ret_flags;
@@ -660,8 +662,8 @@ int arch_mmu_map(arch_aspace_t *const aspace, const vaddr_t vaddr, const paddr_t
         return ERR_INVALID_ARGS;
     }
 
-    if (!is_valid_vaddr(aspace, vaddr)) {
-        return ERR_INVALID_ARGS;
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
     }
 
     if (count == 0) {
@@ -799,7 +801,7 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     return NO_ERROR;
 }
 
-void arch_mmu_context_switch(arch_aspace_t *new_aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *new_aspace) {
     if (TRACE_CONTEXT_SWITCH) {
         TRACEF("aspace %p\n", new_aspace);
     }

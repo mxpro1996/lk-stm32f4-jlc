@@ -8,7 +8,9 @@
 
 // Still useful but disabled 8250 driver that was written against the driver/device interface
 // which has been removed.
-// TODO: rewrite this driver against the regular uart interface and move to dev/uart/8250/...
+// TODO: delete this in favour of dev/uart/dwc8250, which already implements the regular uart
+// interface over the same register set. What it lacks is a port I/O accessor: it addresses the
+// registers through mmio_read8/mmio_write8, and the PC parts sit behind inp/outp instead.
 
 #if 0
 #include <arch/x86.h>

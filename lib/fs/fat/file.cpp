@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "dir.h"
 #include "fat_fs.h"
 #include "fat_priv.h"
 
@@ -24,11 +23,7 @@
 
 #define LOCAL_TRACE FAT_GLOBAL_TRACE(0)
 
-fat_file::fat_file(fat_fs *f)
-    : fs_(f) {}
-fat_file::~fat_file() = default;
-
-status_t fat_file::zero_range_locked(uint32_t offset, uint32_t len) {
+status_t fat_vnode::zero_range_locked(uint32_t offset, uint32_t len) {
     DEBUG_ASSERT(fs_->lock.is_held());
 
     if (len == 0) {
@@ -81,94 +76,7 @@ status_t fat_file::zero_range_locked(uint32_t offset, uint32_t len) {
     return NO_ERROR;
 }
 
-void fat_file::inc_ref() {
-    ref_++;
-    LTRACEF_LEVEL(2, "file %p (%u:%u): ref now %i\n", this, dir_loc_.starting_dir_cluster, dir_loc_.dir_offset, ref_);
-    if (ref_ == 1) {
-        DEBUG_ASSERT(!list_in_list(&node_));
-        fs_->add_to_file_list(this);
-    }
-    DEBUG_ASSERT(list_in_list(&node_));
-}
-
-bool fat_file::dec_ref() {
-    ref_--;
-    LTRACEF_LEVEL(2, "file %p (%u:%u): ref now %i\n", this, dir_loc_.starting_dir_cluster, dir_loc_.dir_offset, ref_);
-    if (ref_ == 0) {
-        DEBUG_ASSERT(list_in_list(&node_));
-        list_delete(&node_);
-        return true;
-    }
-
-    return false;
-}
-
-status_t fat_file::open_file_priv(const dir_entry &entry, const dir_entry_location &loc) {
-    DEBUG_ASSERT(fs_->lock.is_held());
-
-    LTRACEF("found file at location %u:%u\n", loc.starting_dir_cluster, loc.dir_offset);
-
-    // move this out to the wrapper function so we can properly deal with dirs
-    //
-    // did we get a file?
-    if (entry.attributes != fat_attribute::directory) {
-        // XXX better attribute testing
-        start_cluster_ = entry.start_cluster;
-        length_ = entry.length;
-        attributes_ = entry.attributes;
-        dir_loc_ = loc;
-        inc_ref();
-        return NO_ERROR;
-    } else if (entry.attributes == fat_attribute::directory) {
-        // we can open directories, but just not do anything with it except stat
-        start_cluster_ = entry.start_cluster;
-        length_ = 0;
-        attributes_ = entry.attributes;
-        dir_loc_ = loc;
-        inc_ref();
-        return NO_ERROR;
-    } else {
-        return ERR_NOT_VALID;
-    }
-}
-
-// static
-status_t fat_file::open_file(fscookie *cookie, const char *path, filecookie **fcookie) {
-    fat_fs *fs = (fat_fs *)cookie;
-
-    LTRACEF("fscookie %p path '%s' fcookie %p\n", cookie, path, fcookie);
-
-    AutoLock guard(fs->lock);
-
-    // look for the file in the fs
-    dir_entry entry;
-    dir_entry_location loc;
-    status_t err = fat_dir_walk(fs, path, &entry, &loc);
-    if (err != NO_ERROR) {
-        return err;
-    }
-
-    // we found it, see if there's an existing file object
-    fat_file *file = fs->lookup_file(loc);
-    if (!file) {
-        // didn't find an existing one, create a new object
-        file = new fat_file(fs);
-    }
-    DEBUG_ASSERT(file);
-
-    // perform file object private open
-    err = file->open_file_priv(entry, loc);
-    if (err < 0) {
-        delete file;
-        return err;
-    }
-
-    *fcookie = (filecookie *)file;
-
-    return err;
-}
-
-ssize_t fat_file::read_file_priv(void *_buf, const off_t offset, size_t len) {
+ssize_t fat_vnode::read(void *_buf, const off_t offset, size_t len) {
     uint8_t *buf = (uint8_t *)_buf;
 
     LTRACEF("file %p buf %p offset %lld len %zu\n", this, _buf, offset, len);
@@ -261,66 +169,33 @@ ssize_t fat_file::read_file_priv(void *_buf, const off_t offset, size_t len) {
     return amount_read;
 }
 
-// static
-ssize_t fat_file::read_file(filecookie *fcookie, void *_buf, const off_t offset, size_t len) {
-    fat_file *file = (fat_file *)fcookie;
-
-    return file->read_file_priv(_buf, offset, len);
+ssize_t fat_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len) {
+    return vnode_of(vn)->read(buf, offset, len);
 }
 
-status_t fat_file::stat_file_priv(struct file_stat *stat) {
+status_t fat_vnode::stat(struct file_stat *out) {
     AutoLock guard(fs_->lock);
 
-    LTRACEF("file %p state %p\n", this, stat);
+    LTRACEF("vnode %p stat %p\n", this, out);
 
-    stat->size = length_;
-    stat->is_dir = is_dir();
+    // directories, the root included, have no length of their own
+    out->size = length_;
+    out->is_dir = is_dir();
     return NO_ERROR;
 }
 
-// static
-status_t fat_file::stat_file(filecookie *fcookie, struct file_stat *stat) {
-    fat_file *file = (fat_file *)fcookie;
-
-    return file->stat_file_priv(stat);
+status_t fat_stat(struct fs_vnode *vn, struct file_stat *stat) {
+    return vnode_of(vn)->stat(stat);
 }
 
-status_t fat_file::close_file_priv(bool *last_ref) {
-    AutoLock guard(fs_->lock);
+status_t fat_create(struct fs_vnode *dir, const char *name, uint64_t len,
+                    struct fs_vnode **out) {
+    fat_vnode *dirv = vnode_of(dir);
+    fat_fs *fs = dirv->fs();
 
-    // drop a ref to it, which may remove from the global list
-    // and return whether or not it was the last ref
-    *last_ref = dec_ref();
+    LTRACEF("dir %p name '%s' len %" PRIu64 "\n", dirv, name, len);
 
-    return NO_ERROR;
-}
-
-// static
-status_t fat_file::close_file(filecookie *fcookie) {
-    fat_file *file = (fat_file *)fcookie;
-
-    LTRACEF("file %p\n", file);
-
-    bool last_ref;
-    status_t err = file->close_file_priv(&last_ref);
-    if (err < 0) {
-        return err;
-    }
-
-    // if this was the last ref, delete the file
-    if (last_ref) {
-        LTRACEF("last ref, deleting %p (%u:%u)\n", file, file->dir_loc().starting_dir_cluster, file->dir_loc().dir_offset);
-        delete file;
-    }
-
-    return NO_ERROR;
-}
-
-// static
-status_t fat_file::create_file(fscookie *cookie, const char *path, filecookie **fcookie, uint64_t len) {
-    fat_fs *fs = (fat_fs *)cookie;
-
-    LTRACEF("fs %p path '%s' len %" PRIu64 "\n", fs, path, len);
+    DEBUG_ASSERT(dirv->is_dir());
 
     // currently only support zero length files
     if (len != 0) {
@@ -331,28 +206,41 @@ status_t fat_file::create_file(fscookie *cookie, const char *path, filecookie **
         return ERR_NOT_ALLOWED;
     }
 
-    {
-        AutoLock guard(fs->lock);
+    AutoLock guard(fs->lock);
 
-        // tell the dir code to find us a spot
-        dir_entry_location loc;
-        status_t err = fat_dir_allocate(fs, path, fat_attribute::file, 0, 0, &loc);
-        if (err < 0) {
-            return err;
-        }
+    // tell the dir code to find us a spot
+    dir_entry_location loc = {};
+    uint32_t record_start_offset = 0;
+    status_t err = fat_dir_allocate(fs, dirv->start_cluster(), name, fat_attribute::file, 0, 0,
+                                    &loc, &record_start_offset);
+    if (err < 0) {
+        return err;
+    }
 
-        // we have found and allocated a spot
-        fat_file *file = new fat_file(fs);
-        file->dir_loc_ = loc;
-        file->inc_ref();
-        *fcookie = (filecookie *)file;
+    const dir_entry entry = {
+        .attributes = fat_attribute::file,
+        .length = 0,
+        .start_cluster = 0,
+    };
+
+    err = fat_vnode_create(fs, entry, loc, record_start_offset, out);
+    if (err < 0) {
+        // undo the entry we just wrote rather than leave a file nothing can open
+        fat_dir_remove_entry(fs, loc, record_start_offset);
+        return err;
     }
 
     return NO_ERROR;
 }
 
-status_t fat_file::truncate_file_priv(uint64_t _len) {
+status_t fat_vnode::truncate(uint64_t _len) {
     LTRACEF("file %p, len %" PRIu64 " \n", this, _len);
+
+    // a directory can be opened as a file handle, and the root has no entry to
+    // write a length back to at all
+    if (is_dir()) {
+        return ERR_NOT_FILE;
+    }
 
     if (_len == length_) {
         return NO_ERROR;
@@ -388,7 +276,7 @@ status_t fat_file::truncate_file_priv(uint64_t _len) {
         if (new_cluster_count == current_cluster_count) {
             // new length doesn't change the cluster count
             // update the dir entry and move on
-            status_t err = fat_dir_update_entry(fs_, dir_loc_, start_cluster_, len32);
+            status_t err = fat_dir_update_entry(fs_, loc_, start_cluster_, len32);
             if (err != NO_ERROR) {
                 return err;
             }
@@ -417,7 +305,7 @@ status_t fat_file::truncate_file_priv(uint64_t _len) {
             }
 
             // update the dir entry, linking the first cluster in our chain if it's the first one
-            err = fat_dir_update_entry(fs_, dir_loc_, start_cluster_ ? start_cluster_ : first_cluster, len32);
+            err = fat_dir_update_entry(fs_, loc_, start_cluster_ ? start_cluster_ : first_cluster, len32);
             if (err != NO_ERROR) {
                 return err;
             }
@@ -477,7 +365,7 @@ status_t fat_file::truncate_file_priv(uint64_t _len) {
                 }
             }
 
-            status_t err = fat_dir_update_entry(fs_, dir_loc_, new_start_cluster, len32);
+            status_t err = fat_dir_update_entry(fs_, loc_, new_start_cluster, len32);
             if (err != NO_ERROR) {
                 return err;
             }
@@ -492,7 +380,7 @@ status_t fat_file::truncate_file_priv(uint64_t _len) {
     return NO_ERROR;
 }
 
-ssize_t fat_file::write_file_priv(const void *_buf, const off_t offset, size_t len) {
+ssize_t fat_vnode::write(const void *_buf, const off_t offset, size_t len) {
     const uint8_t *buf = (const uint8_t *)_buf;
 
     LTRACEF("file %p buf %p offset %lld len %zu\n", this, _buf, offset, len);
@@ -519,7 +407,7 @@ ssize_t fat_file::write_file_priv(const void *_buf, const off_t offset, size_t l
     }
 
     if (end > length_) {
-        status_t err = truncate_file_priv(end);
+        status_t err = truncate(end);
         if (err != NO_ERROR) {
             return err;
         }
@@ -570,16 +458,10 @@ ssize_t fat_file::write_file_priv(const void *_buf, const off_t offset, size_t l
     return written;
 }
 
-// static
-ssize_t fat_file::write_file(filecookie *fcookie, const void *buf, const off_t offset, size_t len) {
-    fat_file *file = (fat_file *)fcookie;
-
-    return file->write_file_priv(buf, offset, len);
+ssize_t fat_write(struct fs_vnode *vn, const void *buf, off_t offset, size_t len) {
+    return vnode_of(vn)->write(buf, offset, len);
 }
 
-// static
-status_t fat_file::truncate_file(filecookie *fcookie, uint64_t len) {
-    fat_file *file = (fat_file *)fcookie;
-
-    return file->truncate_file_priv(len);
+status_t fat_truncate(struct fs_vnode *vn, uint64_t len) {
+    return vnode_of(vn)->truncate(len);
 }

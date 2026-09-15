@@ -28,7 +28,18 @@ struct arch_aspace {
     // range of address space
     vaddr_t base;
     size_t size;
+
+    // satp asid this aspace runs under. kernel_asid() for the kernel aspace,
+    // 0 for every user aspace when the cpu has too few asid bits to hand them out
+    uint16_t asid;
+
+    // cpus that currently have this aspace loaded, kept by arch_mmu_context_switch()
+    volatile int active_cpus;
 };
+
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return __atomic_load_n(&aspace->active_cpus, __ATOMIC_RELAXED);
+}
 
 #define RISCV_ASPACE_MAGIC 'RVAS'
 

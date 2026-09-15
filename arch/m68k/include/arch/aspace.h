@@ -9,7 +9,10 @@
 
 #include <arch/m68k/mmu.h>
 
+#include <lk/compiler.h>
 #include <sys/types.h>
+
+__BEGIN_CDECLS
 
 struct arch_aspace {
     /* virtual address range covered by this address space */
@@ -22,3 +25,10 @@ struct arch_aspace {
 
     uint32_t flags;
 };
+
+/* not tracked on m68k */
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return 0;
+}
+
+__END_CDECLS

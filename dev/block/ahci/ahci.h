@@ -11,11 +11,12 @@
 #include <kernel/thread.h>
 #include <lk/bits.h>
 #include <lk/cpp.h>
-#include <lk/list.h>
+#include <lktl/list.h>
 #include <lk/reg.h>
 
 #include "ahci_hw.h"
 
+class ahci_disk;
 class ahci_port;
 
 class ahci final {
@@ -76,7 +77,7 @@ class ahci final {
     uint32_t num_ports_ = 0;
 
     // list of disks we've found
-    list_node disk_list_ = LIST_INITIAL_VALUE(disk_list_);
+    lk::list<ahci_disk> disk_list_;
 };
 
 inline uint32_t ahci::read_reg(ahci_reg reg) {

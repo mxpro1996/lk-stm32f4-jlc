@@ -23,6 +23,7 @@ GLOBAL_DEFINES += \
 HANDLED_CORE := true
 ENABLE_THUMB := true
 SUBARCH := arm-m
+ARM_WITHOUT_LOCK_FREE_ATOMICS := true
 endif
 ifeq ($(ARM_CPU),cortex-m0plus)
 GLOBAL_DEFINES += \
@@ -34,6 +35,7 @@ GLOBAL_DEFINES += \
 HANDLED_CORE := true
 ENABLE_THUMB := true
 SUBARCH := arm-m
+ARM_WITHOUT_LOCK_FREE_ATOMICS := true
 endif
 ifeq ($(ARM_CPU),cortex-m3)
 GLOBAL_DEFINES += \
@@ -84,6 +86,20 @@ HANDLED_CORE := true
 ENABLE_THUMB := true
 SUBARCH := arm-m
 endif
+ifeq ($(ARM_CPU),cortex-m33f)
+GLOBAL_DEFINES += \
+	ARM_CPU_CORTEX_M33=1 \
+	ARM_CPU_CORTEX_M33F=1 \
+	ARM_ISA_ARMv8=1 \
+	ARM_ISA_ARMv8M=1 \
+	ARM_WITH_THUMB=1 \
+	ARM_WITH_THUMB2=1 \
+	ARM_WITH_VFP=1 \
+	ARM_WITH_VFP_SP_ONLY=1
+HANDLED_CORE := true
+ENABLE_THUMB := true
+SUBARCH := arm-m
+endif
 ifeq ($(ARM_CPU),cortex-m55)
 GLOBAL_DEFINES += \
 	ARM_CPU_CORTEX_M55=1 \
@@ -118,8 +134,7 @@ GLOBAL_DEFINES += \
 	ARM_WITH_THUMB2=1 \
 	ARM_WITH_CACHE=1 \
 	ARM_WITH_VFP=1 \
-	ARM_WITH_VFP_SP_ONLY=1 \
-	WITH_NO_FP=1
+	ARM_WITH_VFP_SP_ONLY=1
 HANDLED_CORE := true
 ENABLE_THUMB := true
 SUBARCH := arm-m
@@ -244,6 +259,18 @@ ifneq ($(HANDLED_CORE),true)
 $(error $(LOCAL_DIR)/rules.mk doesnt have logic for arm core $(ARM_CPU))
 endif
 
+# Cores with no atomic read-modify-write instruction (armv6-m has no
+# ldrex/strex) make the compiler emit calls into libatomic, which no bare metal
+# toolchain ships. Provide the routines ourselves.
+ifeq ($(ARM_WITHOUT_LOCK_FREE_ATOMICS),true)
+MODULE_DEPS += lib/atomic_fallback
+ifeq ($(TOOLCHAIN),clang)
+# clang reports a max lock free size of 0 bytes for these cores and warns at
+# every atomic access, including the ones it is about to turn into a call.
+GLOBAL_COMPILEFLAGS += -Wno-atomic-alignment
+endif
+endif
+
 THUMBCFLAGS :=
 THUMBINTERWORK :=
 ifeq ($(ENABLE_THUMB),true)
@@ -332,13 +359,20 @@ endif
 endif
 ifeq ($(SUBARCH),arm-m)
 MODULE_SRCS += \
-	$(LOCAL_DIR)/arm-m/arch.c \
 	$(LOCAL_DIR)/arm-m/cache.c \
 	$(LOCAL_DIR)/arm-m/exceptions.c \
 	$(LOCAL_DIR)/arm-m/spin_cycles.c \
 	$(LOCAL_DIR)/arm-m/start.c \
-	$(LOCAL_DIR)/arm-m/thread.c \
 	$(LOCAL_DIR)/arm-m/vectab.c
+
+# arch.c enables the FPU via CPACR and thread.c saves and restores the FP
+# context across a switch. Both are guarded by CMSIS's __FPU_USED, which is
+# only 1 when the file itself is compiled with the float switches, so these
+# two have to be built as float sources. The same applies to the arm32 files
+# above.
+MODULE_FLOAT_SRCS += \
+	$(LOCAL_DIR)/arm-m/arch.c \
+	$(LOCAL_DIR)/arm-m/thread.c
 
 # we're building for small binaries
 GLOBAL_DEFINES += \
@@ -413,5 +447,10 @@ $(OUTELF).stack: $(OUTELF)
 
 EXTRA_BUILDDEPS += $(OUTELF).stack
 GENERATED += $(OUTELF).stack
+
+MODULE_WEAK_DEPS += \
+	dev/cache/pl310 \
+	dev/interrupt/arm_gic \
+	dev/timer/arm_cortex_a9
 
 include make/module.mk

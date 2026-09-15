@@ -197,11 +197,19 @@ __WEAK EfiStatus free_pool(void *mem) {
 }
 
 __WEAK EfiStatus free_pages(void *memory, size_t pages) {
-  auto pa = reinterpret_cast<void *>(vaddr_to_paddr(memory));
-  if (pa != memory) {
+  auto pa = vaddr_to_paddr(memory);
+  if (pa != reinterpret_cast<paddr_t>(memory)) {
     printf("WARN: virtual address %p is not identity mapped, physical addr: "
            "%p\n",
-           memory, pa);
+           memory, reinterpret_cast<void *>(pa));
+  }
+  // pmm_free_kpages expects a kernel virtual address. Keep the permanent
+  // kernel mapping before removing the UEFI identity mapping below.
+  auto kernel_memory = paddr_to_kvaddr(pa);
+  if (kernel_memory == nullptr) {
+    printf("Failed to find kernel mapping for physical pages %p %zu\n",
+           reinterpret_cast<void *>(pa), pages);
+    return EFI_STATUS_DEVICE_ERROR;
   }
   status_t err =
       vmm_free_region(set_boot_aspace(), reinterpret_cast<vaddr_t>(memory));
@@ -210,10 +218,10 @@ __WEAK EfiStatus free_pages(void *memory, size_t pages) {
            pages);
     return EFI_STATUS_DEVICE_ERROR;
   }
-  auto pages_freed = pmm_free_kpages(pa, pages);
+  auto pages_freed = pmm_free_kpages(kernel_memory, pages);
   if (pages_freed != pages) {
-    printf("Failed to free physical pages %p %zu, only freed %zu pages\n", pa,
-           pages, pages_freed);
+    printf("Failed to free physical pages %p %zu, only freed %zu pages\n",
+           reinterpret_cast<void *>(pa), pages, pages_freed);
     return EFI_STATUS_DEVICE_ERROR;
   }
   return EFI_STATUS_SUCCESS;

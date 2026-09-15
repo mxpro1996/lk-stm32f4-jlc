@@ -25,6 +25,11 @@ struct arch_aspace {
     struct list_node pt_page_list;
 };
 
+/* not tracked on arm */
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return 0;
+}
+
 static inline bool arch_mmu_is_valid_vaddr(struct arch_aspace *aspace, vaddr_t vaddr) {
     return (vaddr >= aspace->base && vaddr <= aspace->base + aspace->size - 1);
 }

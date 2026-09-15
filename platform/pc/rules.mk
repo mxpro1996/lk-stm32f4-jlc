@@ -2,6 +2,8 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
+MODULE_OPTIONS := test
+
 # two implementations, modern and legacy
 # legacy implies older hardware, pre pentium, pre pci
 CPU ?= modern
@@ -27,6 +29,7 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/keyboard.c \
     $(LOCAL_DIR)/mp.c \
     $(LOCAL_DIR)/mp-boot.S \
+    $(LOCAL_DIR)/pci.c \
     $(LOCAL_DIR)/pic.c \
     $(LOCAL_DIR)/pit.c \
     $(LOCAL_DIR)/platform.c \
@@ -56,5 +59,10 @@ RUST_CFLAGS := \
     #  -Zdwarf-version=5 -Cdebuginfo=2
     # -Zfunction-return=thunk-extern
     # -Zpatchable-function-entry=16,16
+
+MODULE_WEAK_DEPS += \
+	dev/bus/pci \
+	dev/virtio \
+	lib/minip
 
 include make/module.mk

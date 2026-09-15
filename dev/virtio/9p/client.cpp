@@ -29,6 +29,7 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <stdlib.h>
 
 #if WITH_KERNEL_VM
@@ -42,9 +43,12 @@
 static status_t pdu_init(struct p9_fcall *pdu, size_t size)
 {
 #if WITH_KERNEL_VM
+    // PDUs are handed to the device through the virtqueue, so like the ring itself they
+    // must be ordinary cached memory rather than a Device mapping. See the comment in
+    // virtio_device::virtio_alloc_ring() for why a Device mapping breaks under KVM.
     vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_9p_pdu", size,
                          (void **)&pdu->sdata, 0, 0,
-                         ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                         ARCH_MMU_FLAG_CACHED);
 #else
     pdu->sdata = (uint8_t*)malloc(size);
 #endif

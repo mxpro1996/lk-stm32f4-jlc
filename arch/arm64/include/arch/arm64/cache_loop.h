@@ -43,6 +43,7 @@
     cmp     x1, x2
     blo     .Lcache_range_op_loop\@
     dsb     sy
+    sub     x1, x2, x0                  // x1 = len again, so a second op can follow on the same range
 .endm
 
 // Routine to iterate over all ways/sets across all levels of data caches

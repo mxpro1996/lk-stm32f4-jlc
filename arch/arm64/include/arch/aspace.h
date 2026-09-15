@@ -23,7 +23,18 @@ struct arch_aspace {
     /* range of address space */
     vaddr_t base;
     size_t size;
+
+    /* tag for this aspace's TLB entries; ASID_KERNEL for the kernel aspace, whose
+     * entries are global and carry none */
+    uint16_t asid;
+
+    /* cpus that currently have this aspace loaded, kept by arch_mmu_context_switch() */
+    volatile int active_cpus;
 };
+
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return __atomic_load_n(&aspace->active_cpus, __ATOMIC_RELAXED);
+}
 
 __END_CDECLS
 

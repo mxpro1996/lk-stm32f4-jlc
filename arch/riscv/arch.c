@@ -146,6 +146,9 @@ void arch_enter_uspace(vaddr_t entry_point, vaddr_t user_stack_top) {
     DEBUG_ASSERT(IS_ALIGNED(user_stack_top, 8));
 
     thread_t *ct = get_current_thread();
+#if WITH_KERNEL_VM
+    DEBUG_ASSERT(ct->aspace);
+#endif
 
     // Compute the top of the current thread's kernel stack, aligned to 16 bytes.
     vaddr_t kernel_stack_top = (uintptr_t)ct->stack + ct->stack_size;

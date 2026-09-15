@@ -10,6 +10,7 @@
 #if ARCH_HAS_MMU
 
 #include <arch.h>
+#include <arch/defines.h>
 #include <lk/compiler.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -41,6 +42,17 @@ typedef struct arch_aspace arch_aspace_t;
 
 #define ARCH_ASPACE_FLAG_KERNEL         (1U<<0)
 
+/* [vaddr, vaddr + count pages) lies inside the aspace. Computed so an aspace
+ * that runs to the top of the address space does not overflow. Map, unmap and
+ * query return ERR_OUT_OF_RANGE for anything outside. */
+static inline bool arch_mmu_range_in_aspace(const arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
+    if (vaddr < aspace->base || vaddr > aspace->base + aspace->size - 1) {
+        return false;
+    }
+    const size_t pages_left = (aspace->base + aspace->size - 1 - vaddr) / PAGE_SIZE + 1;
+    return count <= pages_left;
+}
+
 /* initialize per address space */
 status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, uint flags) __NONNULL((1));
 status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) __NONNULL((1));
@@ -56,10 +68,20 @@ vaddr_t arch_mmu_pick_spot(arch_aspace_t *aspace,
                            vaddr_t align, size_t size, uint arch_mmu_flags) __NONNULL((1));
 
 /*
- * load a new user address space context.
- * aspace argument NULL should unload user space.
+ * Load a new user address space context on the current cpu.
+ * new_aspace NULL unloads user space, leaving only the kernel mapped.
+ * old_aspace is the user aspace the cpu had loaded before the call (NULL if
+ * none) and is only there for bookkeeping; the arch may ignore it.
+ * The scheduler calls this with interrupts disabled.
  */
-void arch_mmu_context_switch(arch_aspace_t *aspace);
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *new_aspace);
+
+/*
+ * Each arch/aspace.h also defines
+ *   static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace);
+ * returning how many cpus currently have the user aspace loaded, as counted by
+ * arch_mmu_context_switch(). An arch that does not keep the count returns 0.
+ */
 
 __END_CDECLS
 

@@ -100,5 +100,44 @@ typedef uintptr_t riscv_pte_t;
 #define RISCV_SATP_ASID_MASK  ((1UL << RISCV_SATP_ASID_SIZE) - 1)
 #endif
 
+#ifndef ASSEMBLY
+#include <lk/compiler.h>
+#include <sys/types.h>
+
+__BEGIN_CDECLS
+
+/*
+ * Local TLB maintenance. sfence.vma also orders every earlier page table store
+ * on this hart before later implicit translations, so a fence follows each table
+ * update. Other harts get theirs through mp_sync_exec().
+ *
+ * With rs2 = x0 the fence covers every asid, global entries included; with an
+ * asid in a register it leaves global entries alone. The asid is widened to a
+ * full register before use so no stray upper bits reach the instruction.
+ */
+
+/* every entry, every asid */
+static inline void riscv_tlb_flush_all(void) {
+    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+}
+
+/* all non-global entries of one asid */
+static inline void riscv_tlb_flush_asid(uint16_t asid) {
+    __asm__ volatile("sfence.vma zero, %0" ::"r"((ulong)asid) : "memory");
+}
+
+/* one address under every asid, global entries included */
+static inline void riscv_tlb_flush_va_all_asids(vaddr_t va) {
+    __asm__ volatile("sfence.vma %0, zero" ::"r"(va) : "memory");
+}
+
+/* one address under one asid, global entries excluded */
+static inline void riscv_tlb_flush_va_asid(vaddr_t va, uint16_t asid) {
+    __asm__ volatile("sfence.vma %0, %1" ::"r"(va), "r"((ulong)asid) : "memory");
+}
+
+__END_CDECLS
+#endif // !ASSEMBLY
+
 #endif // RISCV_MMU
 

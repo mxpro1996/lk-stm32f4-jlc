@@ -365,7 +365,7 @@ status_t virtio_gpu_start(virtio_device *dev) {
     }
 
     /* attach a backing store to the resource */
-    size_t len = gdev->pmode.r.width * gdev->pmode.r.height * 4;
+    size_t len = (size_t)gdev->pmode.r.width * gdev->pmode.r.height * 4;
 #if WITH_KERNEL_VM
     gdev->fb = pmm_alloc_kpages(ROUNDUP(len, PAGE_SIZE) / PAGE_SIZE, NULL);
 #else
@@ -445,6 +445,13 @@ status_t virtio_gpu_init(virtio_device *dev) {
     dev->bus()->virtio_status_acknowledge_driver();
 
     // XXX check features bits and ack/nak them
+
+    /* confirm the feature set before configuring the queue */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-gpu: device rejected feature negotiation\n");
+        return err;
+    }
 
     /* allocate a virtio ring */
     dev->virtio_alloc_ring(0, 16);

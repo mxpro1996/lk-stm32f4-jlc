@@ -25,4 +25,9 @@ struct arch_aspace {
     size_t size;
 };
 
+/* not tracked on x86 */
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return 0;
+}
+
 __END_CDECLS

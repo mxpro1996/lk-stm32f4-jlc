@@ -564,7 +564,7 @@ status_t ptable_scan(const char *bdev_name, uint64_t offset) {
 
     err = bio_read(ptable.bdev, &header, offset, sizeof(header));
     if (err < (ssize_t)sizeof(header)) {
-        LTRACEF("failed to read partition table header @%llu (%ld)\n", offset, err);
+        LTRACEF("failed to read partition table header @%llu (%zd)\n", offset, err);
         goto bailout;
     }
 

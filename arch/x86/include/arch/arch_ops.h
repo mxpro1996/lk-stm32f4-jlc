@@ -10,9 +10,15 @@
 
 #ifndef ASSEMBLY
 
+/* before arch/ops.h so it leaves out its empty arch_spinloop_pause() */
+#define ARCH_HAS_SPINLOOP_PAUSE 1
 #include <arch/ops.h>
 #include <arch/x86.h>
 #include <lk/compiler.h>
+
+static inline void arch_spinloop_pause(void) {
+    __asm__ volatile("pause" ::: "memory");
+}
 
 static inline ulong arch_cycle_count(void) {
 #if X86_LEGACY
@@ -68,9 +74,9 @@ static inline uint arch_curr_cpu_num(void) {
 
 #ifdef WITH_SMP
 // XXX probably too strict
-#define smp_mb()  mb
-#define smp_rmb() rmb
-#define smp_wmb() wmb
+#define smp_mb()  mb()
+#define smp_rmb() rmb()
+#define smp_wmb() wmb()
 #else
 #define smp_mb()  CF
 #define smp_wmb() CF

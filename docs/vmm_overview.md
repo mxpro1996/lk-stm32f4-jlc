@@ -140,7 +140,7 @@ In LK, similar to many system, a process contains two separate virtual address s
 
 Address Space
 
-It's worth noting that, unlike some other kernels, the kernel space in LK doesn’t contains user space mapping. It means the kernel code can’t access user space memory directly.
+The kernel half of the address space is the same in every aspace, so kernel code runs the same regardless of which user aspace is loaded. Nothing stops the kernel from touching user addresses while a user aspace is active: none of the arches enable the protections that would (SMAP on x86, PAN on arm64, clearing SUM on riscv), which the arch tests rely on to read user pages directly.
 
 The ranges for both the kernel and user address spaces are defined at:
 
@@ -187,6 +187,71 @@ static void vm_init_postheap(uint level) {
 ```
 
 In the function vmm_reserve_space, LK creates a vmm_region, inserts it into region_list. More importantly, the function also updates the page table (pointed by tt_virt / tt_phys) to tell the processor that these pages are reserved.
+
+# User address spaces
+
+Each thread carries the user aspace it runs in (`thread_t::aspace`, NULL for a
+kernel-only thread), and `vmm_set_active_aspace()` switches the current thread
+to another one. When the scheduler switches between threads with different
+aspaces it calls `vmm_context_switch(old, new)`, which hands both ends of the
+switch to `arch_mmu_context_switch(old, new)`; `new == NULL` loads the
+kernel-only state. On arm64 that means TTBR0 walks are disabled (TCR_EL1.EPD0),
+which is also how every cpu boots, so a stray low address faults rather than
+walking whatever TTBR0 holds. On riscv the kernel root table is loaded, whose
+user half is empty.
+
+## ASIDs
+
+The arm64 and riscv ports tag user TLB entries with an address space identifier
+so they survive a context switch. Both use the allocator in `kernel/vm/asid.c`:
+the kernel is `ASID_KERNEL` (1), user aspaces are handed ids from 2 up, and an
+aspace gives its id back when destroyed, after its entries have been flushed on
+every cpu. The id is only used when the cpu implements the full width, 16 bits
+on either arch (arm64 reports it in `ID_AA64MMFR0_EL1.ASIDBits` and enables it
+with `TCR_EL1.AS`; riscv is probed by writing satp). Otherwise every user aspace
+shares one id and each switch to a different user aspace flushes that id on the
+local cpu. `ARM64_ASID_FALLBACK=1` and `RISCV_ASID_FALLBACK=1` force the shared
+path for testing, since qemu always implements 16 bits.
+
+Kernel mappings are global on both arches (nG clear on arm64, the G bit on
+riscv), so they match under any id and are invalidated with the all-asid forms;
+user descriptors are marked non-global on arm64 so they are actually tagged.
+
+## TLB maintenance
+
+Every change to a translation table is made visible to the table walkers
+before the invalidate that depends on it, and the invalidate is complete on
+every cpu before anything relies on the old translation being gone: freeing a
+page table, reusing an asid, or returning to the caller. On arm64 that is `dsb
+ishst`, a broadcast `tlbi ...is`, then `dsb ish`, with an `isb` for kernel
+mappings. riscv has no broadcast invalidate, so `sfence.vma` runs on every cpu
+through `mp_sync_exec()`, which requires interrupts to be enabled when other
+cpus are up; during early boot with one cpu it simply runs locally. riscv also
+fences after a map, since a cpu may cache a translation for a page that was
+invalid when it last looked. Intermediate tables emptied by an unmap are
+unlinked and freed only after the shootdown.
+
+`arch_mmu_destroy_aspace()` expects every mapping to be gone already, which is
+what frees the lower tables, and no cpu to have the aspace loaded.
+`vmm_free_aspace()` switches the current thread off the aspace first and fails
+with `ERR_BUSY` while another cpu still has it loaded; the arch keeps that
+count in `arch_mmu_context_switch()` and reports it through
+`arch_aspace_active_cpus()`.
+
+## Running in user mode
+
+`arch_enter_uspace(entry, stack_top)` drops the current thread into user mode
+in its active aspace; it never returns. Exceptions taken from user space reach
+the kernel through weak hooks the arch provides: `arm64_syscall()` and
+`arm64_user_exception()`, `riscv_syscall_handler()` and
+`riscv_user_exception()`. The defaults print the frame and end the thread with
+`thread_exit()` rather than panicking, and an override that wants the same
+fallback can call the `*_unhandled()` variants. On arm64 the kernel keeps its
+percpu pointer in x18, which user space may overwrite, so the vectors for
+exceptions from EL0 reload it from a slot at the top of the thread's kernel
+stack that `arch_enter_uspace()` fills and every return to EL0 refreshes.
+`arch_uspace_tests` in `arch/test/` runs a stub through a syscall and a fault
+this way on both arches.
 
 # Physical to virtual mapping
 

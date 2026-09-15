@@ -73,7 +73,8 @@ void process_pending_events() {
     }
   }
   al.release();
-  list_for_every_entry(&completed_events, ev, EfiEventImpl, node) {
+  while ((ev = list_remove_head_type(&completed_events, EfiEventImpl, node)) !=
+         nullptr) {
     invoke_callback(ev);
   }
 }
@@ -102,6 +103,10 @@ EfiStatus wait_for_event(size_t num_events, EfiEvent *event, size_t *index) {
       if (status == ERR_TIMED_OUT) {
         continue;
       }
+      if (status != NO_ERROR) {
+        return EFI_STATUS_DEVICE_ERROR;
+      }
+      *index = i;
       return EFI_STATUS_SUCCESS;
     }
   }

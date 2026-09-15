@@ -108,7 +108,7 @@ void attempt_fs_boot(void) {
     ssize_t n_bytes_erased =
         bio_erase(system_flash, moot_system_info.system_offset, imglen);
     if (n_bytes_erased < (ssize_t)imglen) {
-        LTRACEF("Failed: Unable to erase system flash at '%s'. retcode = %ld\n",
+        LTRACEF("Failed: Unable to erase system flash at '%s'. retcode = %zd\n",
                 moot_system_info.system_flash_name, n_bytes_erased);
         bio_close(system_flash);
         goto finish;
@@ -119,7 +119,7 @@ void attempt_fs_boot(void) {
     bio_close(system_flash);
 
     if (written < (ssize_t)imglen) {
-        LTRACEF("Failed: Unable to write system flash at '%s'. retcode = %ld\n",
+        LTRACEF("Failed: Unable to write system flash at '%s'. retcode = %zd\n",
                 moot_system_info.system_flash_name, written);
         goto finish;
     }

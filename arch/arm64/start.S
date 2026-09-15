@@ -267,7 +267,15 @@ FUNCTION(arm64_reset)
     b       .Lmap_range_one_table_loop
 
 .Linitial_mapping_done:
-    /* compute the base TCR configuration and save away in a global for future use */
+    /*
+     * Compute the base TCR configuration and save it in arm64_mmu_tcr_flags.
+     * mmu.c builds every later TCR value from it: EPD0 is ORed on here and in
+     * arch_mmu_context_switch() rather than stored, and the AS bit set below is
+     * how arch_mmu_init_aspace() learns whether user aspaces get their own ASID.
+     * The kernel mappings built above are global (nG clear, as in the
+     * MMU_PTE_KERNEL_* flags), which mmu.c relies on when it invalidates them
+     * with the all-ASID tlbi forms.
+     */
     /* inner sharable write-back write-allocate */
     movlit  tmp, MMU_TCR_FLAGS_BASE
 
@@ -284,6 +292,20 @@ FUNCTION(arm64_reset)
     mov     tmp2, #5
 1:
     orr     tmp, tmp, tmp2, lsl #32
+
+#if !ARM64_ASID_FALLBACK
+    /*
+     * Set TCR_EL1.AS when the cpu implements 16 bit ASIDs (ID_AA64MMFR0_EL1.ASIDBits == 2).
+     * arch_mmu_init_aspace() reads the bit back from arm64_mmu_tcr_flags to decide
+     * whether user address spaces get their own ASID.
+     */
+    mrs     tmp2, id_aa64mmfr0_el1
+    ubfx    tmp2, tmp2, #4, #4
+    cmp     tmp2, #2
+    b.ne    2f
+    orr     tmp, tmp, #MMU_TCR_AS
+2:
+#endif
     adrp    tmp2, arm64_mmu_tcr_flags
     str     tmp, [tmp2, #:lo12:arm64_mmu_tcr_flags]
 
@@ -377,7 +399,14 @@ LOCAL_FUNCTION(arm64_enable_mmu)
     /* Initialize TCR_EL1 */
     /* set cacheable attributes on translation walk */
     /* (SMP extensions) non-shareable, inner write-back write-allocate */
+    /*
+     * TTBR0 walks stay disabled (EPD0) until arch_mmu_context_switch() loads a user
+     * address space, so a stray low address faults instead of walking whatever
+     * TTBR0 holds. This also makes the fetch that lands us in the trampoline
+     * below fault deterministically.
+     */
     ldr_global tmp, arm64_mmu_tcr_flags
+    orr     tmp, tmp, #MMU_TCR_EPD0
     msr     tcr_el1, tmp
 
     isb

@@ -7,6 +7,8 @@
  */
 
 #include "ext2_priv.h"
+#include <assert.h>
+#include <kernel/mutex.h>
 #include <lib/fs.h>
 #include <lk/debug.h>
 #include <lk/err.h>
@@ -92,8 +94,10 @@ static void endian_swap_group_desc(struct ext2_group_desc *gd) {
     LE16SWAP(gd->bg_used_dirs_count);
 }
 
-status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options) {
-    if (options != 0) {
+status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,
+                    struct fs_vnode **root) {
+    /* the filesystem is intrinsically read-only, so that option is always satisfied */
+    if ((options & ~FS_MOUNT_OPTION_READ_ONLY) != 0) {
         return ERR_INVALID_ARGS;
     }
     int err;
@@ -105,7 +109,13 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
     }
 
     ext2_t *ext2 = malloc(sizeof(ext2_t));
+    if (!ext2) {
+        return ERR_NO_MEMORY;
+    }
     ext2->dev = dev;
+    ext2->gd = NULL;
+    ext2->cache = NULL;
+    mutex_init(&ext2->lock);
 
     err = bio_read(dev, &ext2->sb, 1024, sizeof(struct ext2_super_block));
     if (err < 0) {
@@ -116,8 +126,8 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
 
     /* see if the superblock is good */
     if (ext2->sb.s_magic != EXT2_SUPER_MAGIC) {
-        err = -1;
-        return err;
+        err = ERR_NOT_VALID;
+        goto err;
     }
 
     /* calculate group count, rounded up */
@@ -137,24 +147,27 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
 
     /* we only support dynamic revs */
     if (ext2->sb.s_rev_level > EXT2_DYNAMIC_REV) {
-        err = -2;
-        return err;
+        err = ERR_NOT_SUPPORTED;
+        goto err;
     }
 
     /* make sure it doesn't have any ro features we don't support */
     if (ext2->sb.s_feature_ro_compat & ~(EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT2_FEATURE_RO_COMPAT_LARGE_FILE)) {
-        err = -3;
-        return err;
+        err = ERR_NOT_SUPPORTED;
+        goto err;
     }
 
     /* read in all the group descriptors */
     ext2->gd = malloc(sizeof(struct ext2_group_desc) * ext2->s_group_count);
+    if (!ext2->gd) {
+        err = ERR_NO_MEMORY;
+        goto err;
+    }
     err = bio_read(ext2->dev, (void *)ext2->gd,
                    (EXT2_BLOCK_SIZE(ext2->sb) == 4096) ? 4096 : 2048,
                    sizeof(struct ext2_group_desc) * ext2->s_group_count);
     if (err < 0) {
-        err = -4;
-        return err;
+        goto err;
     }
 
     int i;
@@ -171,9 +184,20 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
 
     /* initialize the block cache */
     ext2->cache = bcache_create(ext2->dev, EXT2_BLOCK_SIZE(ext2->sb), 4);
+    if (!ext2->cache) {
+        err = ERR_NO_MEMORY;
+        goto err;
+    }
 
-    /* load the first inode */
-    err = ext2_load_inode(ext2, EXT2_ROOT_INO, &ext2->root_inode);
+    /* Build the root vnode, which also validates that the root inode reads.
+     * This is the only step of the mount that goes through the block cache --
+     * the superblock and group descriptors above are read straight off the
+     * device -- so it is the only one that needs the lock. Nothing else can
+     * reach the mount yet; the lock is here to satisfy the block cache
+     * routines, which assert on it. */
+    mutex_acquire(&ext2->lock);
+    err = ext2_create_vnode(ext2, EXT2_ROOT_INO, root);
+    mutex_release(&ext2->lock);
     if (err < 0) {
         goto err;
     }
@@ -187,15 +211,25 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
 err:
     LTRACEF("exiting with err code %d\n", err);
 
+    if (ext2->cache) {
+        bcache_destroy(ext2->cache);
+    }
+    mutex_destroy(&ext2->lock);
+    free(ext2->gd);
     free(ext2);
     return err;
 }
 
+/* The layer calls this only once the mount's last reference has gone and every
+ * vnode of it has been released, so no thread can be inside a filesystem op or
+ * blocked on the lock, and tearing both the lock and the cache down here is
+ * safe. */
 status_t ext2_unmount(fscookie *cookie) {
     // free it up
     ext2_t *ext2 = (ext2_t *)cookie;
 
     bcache_destroy(ext2->cache);
+    mutex_destroy(&ext2->lock);
     free(ext2->gd);
     free(ext2);
 
@@ -211,13 +245,15 @@ static void get_inode_addr(ext2_t *ext2, inodenum_t num, blocknum_t *block, size
     *block = ext2->gd[group].bg_inode_table;
 
     // add the offset of the inode within the group
-    size_t offset = (num % EXT2_INODES_PER_GROUP(ext2->sb)) * EXT2_INODE_SIZE(ext2->sb);
+    size_t offset = (size_t)(num % EXT2_INODES_PER_GROUP(ext2->sb)) * EXT2_INODE_SIZE(ext2->sb);
     *block_offset = offset % EXT2_BLOCK_SIZE(ext2->sb);
     *block += offset / EXT2_BLOCK_SIZE(ext2->sb);
 }
 
 int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode) {
     int err;
+
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
 
     LTRACEF("num %d, inode %p\n", num, inode);
 
@@ -248,13 +284,59 @@ int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode) {
     return 0;
 }
 
+/* Wrap an inode number in a vnode for the layer. The filesystem hands back a
+ * fresh one every time; the layer deduplicates by the inode number it carries
+ * as the vnode id, so hard links to one object share a single vnode. */
+status_t ext2_create_vnode(ext2_t *ext2, inodenum_t inum, struct fs_vnode **out) {
+    ext2_vnode_t *v = malloc(sizeof(ext2_vnode_t));
+    if (!v) {
+        return ERR_NO_MEMORY;
+    }
+
+    v->ext2 = ext2;
+    v->inum = inum;
+
+    int err = ext2_load_inode(ext2, inum, &v->inode);
+    if (err < 0) {
+        free(v);
+        return err;
+    }
+
+    enum fs_vnode_type type;
+    if (S_ISDIR(v->inode.i_mode)) {
+        type = FS_VNODE_DIR;
+    } else if (S_ISLNK(v->inode.i_mode)) {
+        type = FS_VNODE_SYMLINK;
+    } else {
+        /* anything else -- regular files, and the special files the driver
+         * cannot do anything with either way */
+        type = FS_VNODE_FILE;
+    }
+
+    status_t status = fs_vnode_create(inum, type, v, out);
+    if (status < 0) {
+        free(v);
+        return status;
+    }
+
+    return NO_ERROR;
+}
+
+void ext2_release(struct fs_vnode *vn) {
+    free(vn->priv);
+}
+
 static const struct fs_api ext2_api = {
     .mount = ext2_mount,
     .unmount = ext2_unmount,
-    .open = ext2_open_file,
-    .stat = ext2_stat_file,
-    .read = ext2_read_file,
-    .close = ext2_close_file,
+    .lookup = ext2_lookup,
+    .readlink = ext2_readlink,
+    .release = ext2_release,
+    .read = ext2_read,
+    .stat = ext2_stat,
+    .opendir = ext2_opendir,
+    .readdir = ext2_readdir,
+    .closedir = ext2_closedir,
 };
 
 STATIC_FS_IMPL(ext2, &ext2_api);

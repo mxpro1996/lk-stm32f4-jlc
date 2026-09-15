@@ -21,8 +21,6 @@ STATIC_COMMAND_START
 STATIC_COMMAND("fs", "fs debug commands", &cmd_fs)
 STATIC_COMMAND_END(fs);
 
-extern int fs_mount_type(const char *path, const char *device, const char *name);
-
 static int cmd_fs_ioctl(int argc, const console_cmd_args *argv) {
     if (argc < 3) {
         printf("not enough arguments\n");
@@ -74,8 +72,8 @@ static int cmd_fs_ioctl(int argc, const console_cmd_args *argv) {
                 return err;
             }
 
-            bool is_mapped;
-            err = fs_file_ioctl(handle, request, (void **)&is_mapped);
+            bool is_mapped = false;
+            err = fs_file_ioctl(handle, request, &is_mapped);
             if (err != NO_ERROR) {
                 fs_close_file(handle);
                 return err;

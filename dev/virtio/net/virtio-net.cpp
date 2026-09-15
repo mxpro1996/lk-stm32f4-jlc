@@ -497,6 +497,13 @@ status_t virtio_net_init(virtio_device *dev) {
             (guest_features & VIRTIO_NET_F_STATUS) ? " STATUS" : "",
             (guest_features & VIRTIO_NET_F_GUEST_CSUM) ? " GUEST_CSUM" : "");
 
+    /* confirm the feature set before configuring the queues */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-net: device rejected feature negotiation\n");
+        return err;
+    }
+
     /* set our irq handler */
     dev->set_irq_callbacks(&virtio_net_irq_driver_callback, nullptr);
     dev->bus()->unmask_interrupt();

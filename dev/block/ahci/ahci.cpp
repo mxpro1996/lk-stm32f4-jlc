@@ -4,6 +4,29 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
+// NOTE ON MEMORY ATTRIBUTES AND BARRIERS
+//
+// The command list / FIS / command table region this driver shares with the controller is
+// mapped ARCH_MMU_FLAG_UNCACHED_DEVICE (see ahci_port::init()), and the driver has no memory
+// barriers: it relies on that mapping to order its descriptor writes against the register
+// writes that hand a command to the controller.
+//
+// That works on x86, which is where this driver is used in practice: uncached accesses stay
+// coherent with the caches, and KVM forces guest memory to write-back regardless of what the
+// guest asks for.
+//
+// It does not generalize. The driver is reachable on any PCI capable target, and on arm64
+// under qemu it already binds and works under TCG but takes a data abort under KVM, because on
+// a core without FEAT_S2FWB (ARMv8.4) the guest's uncached accesses and the VMM's cached view
+// of the same page never see each other. A genuinely non-coherent DMA architecture would break
+// it the other way around.
+//
+// Making this driver work on either would mean giving it the same treatment as
+// virtio_device::virtio_alloc_ring() and dev/net/e1000: map the shared region cached and add
+// explicit wmb()/rmb() around the doorbell and completion registers, plus real cache
+// maintenance if the platform is not coherent. Nobody has needed that yet, so it has not been
+// done.
+
 #include "ahci.h"
 
 #include <arch/atomic.h>
@@ -131,7 +154,7 @@ status_t ahci::init_device(pci_location_t loc) {
         DEBUG_ASSERT(disk);
 
         // add the disk to a list for further processing
-        list_add_tail(&disk_list_, &disk->node_);
+        disk_list_.push_back(disk);
     }
 
     return NO_ERROR;
@@ -140,16 +163,15 @@ status_t ahci::init_device(pci_location_t loc) {
 void ahci::disk_probe_worker() {
     LTRACE_ENTRY;
 
-    ahci_disk *disk;
-    list_for_every_entry(&disk_list_, disk, ahci_disk, node_) {
-        disk->identify();
+    for (ahci_disk &disk : disk_list_) {
+        disk.identify();
     }
 
     LTRACE_EXIT;
 }
 
 status_t ahci::start_disk_probe() {
-    if (list_is_empty(&disk_list_)) {
+    if (disk_list_.is_empty()) {
         return NO_ERROR;
     }
 

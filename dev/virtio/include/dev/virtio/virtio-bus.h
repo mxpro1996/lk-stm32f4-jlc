@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <sys/types.h>
 #include <platform/interrupts.h>
 
 class virtio_bus {
@@ -19,8 +20,15 @@ public:
     virtual void virtio_status_acknowledge_driver() = 0;
     virtual uint32_t virtio_read_host_feature_word(uint32_t word) = 0;
     virtual void virtio_set_guest_features(uint32_t word, uint32_t features) = 0;
+    // Confirm the negotiated feature set. The spec requires this to happen after feature
+    // negotiation and before any queue is configured, so drivers should call it themselves
+    // between the two. virtio_status_driver_ok() calls it if the driver did not, and it is a
+    // no-op on the legacy transports, which have no FEATURES_OK bit.
+    virtual status_t virtio_status_features_ok() = 0;
     virtual void virtio_status_driver_ok() = 0;
     virtual void virtio_kick(uint16_t ring_index) = 0;
+    // Largest ring the device accepts for this queue; 0 if the queue does not exist.
+    virtual uint16_t virtio_queue_max_size(uint16_t queue_sel) = 0;
     virtual void register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) = 0;
 
     // Return if the device is legacy or modern.

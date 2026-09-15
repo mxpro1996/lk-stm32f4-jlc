@@ -20,9 +20,9 @@
 
 #define LOCAL_TRACE 0
 
-// Preallocate space for up to 256 vectors.
+// Preallocate space for up to 1024 vectors, the architectural maximum.
 // If more are needed will need to bump this up or switch to a dynamic scheme.
-#define MAX_IRQS 256
+#define MAX_IRQS 1024
 static struct int_handlers {
     int_handler handler;
     void *arg;

@@ -75,6 +75,13 @@ EfiStatus efi_initialize_system_table_pointer(struct EfiSystemTable *system_tabl
   return EFI_STATUS_SUCCESS;
 }
 
+void efi_uninitialize_system_table_pointer() {
+  if (efi_systab_pointer != nullptr) {
+    free_pages(efi_systab_pointer, 1);
+    efi_systab_pointer = nullptr;
+  }
+}
+
 static uint32_t efi_m_max_table_entries;
 
 static constexpr size_t EFI_DEBUG_TABLE_ENTRY_SIZE = (sizeof(union EfiDebugImageInfo));
@@ -132,7 +139,7 @@ EfiStatus efi_core_new_debug_image_info_entry(uint32_t image_info_type,
 
   /* Allocate data for new entry. */
   allocate_pool(EFI_MEMORY_TYPE_BOOT_SERVICES_DATA,
-		      sizeof(union EfiDebugImageInfo),
+		      sizeof(struct EfiDebugImageInfoNormal),
 		      reinterpret_cast<void **>(&table[index].normal_image));
   if (table[index].normal_image) {
     /* Update the entry. */
@@ -250,6 +257,12 @@ void teardown_debug_support(char *image_base) {
       efi_core_remove_debug_image_info_entry(image_base);
       free_pool(device_buf);
       free_pool(efiLoadedImageProtocol);
+
+      if (efi_m_debug_info_table_header.table_size == 0) {
+        free_pool(efi_m_debug_info_table_header.efi_debug_image_info_table);
+        efi_m_debug_info_table_header = {};
+        efi_m_max_table_entries = 0;
+      }
 
       return;
     }

@@ -11,8 +11,13 @@
 #include <platform.h>
 #include <platform/stm32.h>
 #include <arch/arm/cm.h>
+#include <kernel/novm.h>
 #include <stm32f4xx_rcc.h>
 #include "system_stm32f4xx.h"
+
+#if defined(ENABLE_SDRAM)
+#include <platform/sdram.h>
+#endif
 
 void platform_early_init(void) {
     // Crank up the clock before initing timers.
@@ -29,4 +34,9 @@ void platform_early_init(void) {
 
 void platform_init(void) {
     stm32_timer_init();
+#if defined(ENABLE_SDRAM)
+    stm_SDRAM_Init();
+    /* add a novm arena for it */
+    novm_add_arena("sdram", SDRAM_BASE, SDRAM_SIZE);
+#endif
 }

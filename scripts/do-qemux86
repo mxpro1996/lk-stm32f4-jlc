@@ -7,8 +7,10 @@ function HELP {
     local ec=${1:-0}
     echo "help:"
     echo "-6                  : x86-64"
+    echo "-u                  : boot via UEFI firmware (OVMF, implies -6)"
     echo "-l                  : legacy mode build (386 emulated machine)"
     echo "-m <memory in MB>   : memory size (default: 512 MB, 4 MB for legacy)"
+    echo "-M <machine>        : QEMU machine type (default: q35; pc for i440fx; ignored with -l)"
     echo "-s <number of cpus> : number of CPUs (default: 1)"
     echo "-X                  : print QEMU command and exit (dry run)"
     echo
@@ -44,11 +46,14 @@ MEMSIZE=0
 SMP=1
 SUDO=""
 DO_DRYRUN=0
+DO_UEFI=0
+MACHINE_OVERRIDE=""
 
-while getopts A:6d:gf:klm:nN:s:thVX FLAG; do
+while getopts A:6d:gf:klm:M:nN:s:tuhVX FLAG; do
     case $FLAG in
         A) CMDLINE+="${CMDLINE:+ }$(quote_cmdline_arg "$OPTARG")";;
         6) DO_64BIT=1;;
+        u) DO_UEFI=1; DO_64BIT=1;;
         d)
             DISK_IMAGES+=("$OPTARG")
             ;;
@@ -57,6 +62,7 @@ while getopts A:6d:gf:klm:nN:s:thVX FLAG; do
         k) DO_KVM=1;;
         l) DO_LEGACY=1;;
         m) MEMSIZE=$OPTARG;;
+        M) MACHINE_OVERRIDE=$OPTARG;;
         n) DO_NET=1;;
         t) DO_NET_TAP=1;;
         N) NETDEV=$OPTARG; DO_NETDEV_OVERRIDE=1;;
@@ -82,6 +88,37 @@ if (( DO_NETDEV_OVERRIDE && ! ( DO_NET || DO_NET_TAP ) )); then
     exit 1
 fi
 
+if (( DO_UEFI && DO_LEGACY )); then
+    echo "Error: -u (UEFI) is x86-64 only, cannot combine with -l"
+    exit 1
+fi
+
+# find an OVMF firmware code/vars pair for -u
+OVMF_CODE=""
+OVMF_VARS=""
+if (( DO_UEFI )); then
+    for pair in \
+        "/usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd" \
+        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd" \
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd" \
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd" \
+        "/usr/share/qemu/edk2-x86_64-code.fd:/usr/share/qemu/edk2-i386-vars.fd" \
+        "/usr/local/share/qemu/edk2-x86_64-code.fd:/usr/local/share/qemu/edk2-i386-vars.fd" \
+        ; do
+        code="${pair%%:*}"
+        vars="${pair##*:}"
+        if [[ -f "$code" && -f "$vars" ]]; then
+            OVMF_CODE="$code"
+            OVMF_VARS="$vars"
+            break
+        fi
+    done
+    if [[ -z "$OVMF_CODE" ]]; then
+        echo "Error: no OVMF firmware found (install the ovmf / edk2-ovmf package)"
+        exit 1
+    fi
+fi
+
 # pick the appropriate qemu and project
 if (( DO_64BIT )); then
     QEMU="qemu-system-x86_64"
@@ -98,6 +135,11 @@ else
     PROJECT="pc-x86-test"
     CPU=max
     MACHINE=q35
+fi
+
+# -M overrides the machine type for the non-legacy builds (e.g. pc for i440fx)
+if [[ -n "$MACHINE_OVERRIDE" ]] && (( ! DO_LEGACY )); then
+    MACHINE=$MACHINE_OVERRIDE
 fi
 
 if (( DO_LEGACY )); then
@@ -131,10 +173,20 @@ fi
 ARGS+=("-m" "$MEMSIZE")
 ARGS+=("-smp" "$SMP")
 ARGS+=("-machine" "$MACHINE")
-ARGS+=("-kernel" "build-${PROJECT}/lk.elf")
+if (( DO_UEFI )); then
+    # Boot the PE-wrapped kernel through OVMF from a synthesized FAT ESP.
+    # With a command line, boot via the EFI shell's startup.nsh so LoadOptions
+    # carries it (a default EFI/BOOT/BOOTX64.EFI boot gets empty LoadOptions);
+    # the ESP contents are staged by prepare_esp below, after the build.
+    ARGS+=("-drive" "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}")
+    ARGS+=("-drive" "if=pflash,format=raw,file=build-${PROJECT}/OVMF_VARS.fd")
+    ARGS+=("-drive" "format=raw,file=fat:rw:build-${PROJECT}/esp")
+else
+    ARGS+=("-kernel" "build-${PROJECT}/lk.elf")
 
-if [[ -n "$CMDLINE" ]]; then
-    ARGS+=("-append" "$CMDLINE")
+    if [[ -n "$CMDLINE" ]]; then
+        ARGS+=("-append" "$CMDLINE")
+    fi
 fi
 
 ARGS+=("-device" "isa-debug-exit,iobase=0xf4,iosize=0x04")
@@ -213,11 +265,30 @@ CMD+=("$QEMU")
 CMD+=("${ARGS[@]}")
 CMD+=("$@")
 
+# stage the ESP directory that the fat:rw: drive above serves; must run after
+# the build so lk.efi exists
+function prepare_esp {
+    (( DO_UEFI )) || return 0
+    local esp="build-${PROJECT}/esp"
+    rm -rf "$esp"
+    mkdir -p "$esp"
+    # fresh NVRAM every run so stale Boot#### entries don't redirect the boot
+    cp "$OVMF_VARS" "build-${PROJECT}/OVMF_VARS.fd"
+    if [[ -n "$CMDLINE" ]]; then
+        cp "build-${PROJECT}/lk.efi" "$esp/lk.efi"
+        printf 'echo -off\n\\lk.efi %s\n' "$CMDLINE" > "$esp/startup.nsh"
+    else
+        mkdir -p "$esp/EFI/BOOT"
+        cp "build-${PROJECT}/lk.efi" "$esp/EFI/BOOT/BOOTX64.EFI"
+    fi
+}
+
 if (( DO_DRYRUN )); then
     echo "${CMD[@]}"
     exit 0
 fi
 
 "$DIR"/make-parallel $PROJECT &&
+prepare_esp &&
 echo "${CMD[@]}" &&
 exec "${CMD[@]}"

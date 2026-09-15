@@ -13,6 +13,7 @@
 #include <lk/cpp.h>
 #include <lk/debug.h>
 #include <lk/err.h>
+#include <lktl/auto_call.h>
 #include <memory>
 #include <new>
 #include <rand.h>
@@ -580,7 +581,8 @@ bool test_fat_stress_dir_slot_reuse() {
     }
     EXPECT_EQ(kNames, found);
 
-    // the directory listing must agree with that: kNames entries plus . and ..
+    // the directory listing must agree with that. Only the files: "." and ".."
+    // are on disk in a subdirectory but are not part of a listing.
     dirhandle *dh = nullptr;
     ASSERT_EQ(NO_ERROR, fs_open_dir(dir, &dh));
     int count = 0;
@@ -589,7 +591,7 @@ bool test_fat_stress_dir_slot_reuse() {
         count++;
     }
     ASSERT_EQ(NO_ERROR, fs_close_dir(dh));
-    EXPECT_EQ(kNames + 2, count);
+    EXPECT_EQ(kNames, count);
 
     for (int i = 0; i < kNames; i++) {
         make_name(i, (i % 2 == 0) ? 11 : 0);
