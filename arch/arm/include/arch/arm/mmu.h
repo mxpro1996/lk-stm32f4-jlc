@@ -101,6 +101,10 @@
 #define MMU_MEMORY_L2_AP_P_RO_U_NA          ((0x1 << 9) | (0x1 << 4))
 #define MMU_MEMORY_L2_AP_MASK               ((0x1 << 9) | (0x3 << 4))
 
+/* AP[2] alone: read only, for privileged and user access alike */
+#define MMU_MEMORY_L1_AP_RO                 (0x1 << 15)
+#define MMU_MEMORY_L2_AP_RO                 (0x1 << 9)
+
 #define MMU_MEMORY_L1_PAGETABLE_NON_SECURE  (1 << 3)
 
 #define MMU_MEMORY_L1_SECTION_NON_SECURE    (1 << 19)
@@ -115,6 +119,7 @@
 #define MMU_MEMORY_SET_L1_OUTER(val)        (((val) & 0x3) << MMU_MEMORY_L1_TEX_SHIFT)
 #define MMU_MEMORY_SET_L1_CACHEABLE_MEM     (0x4 << MMU_MEMORY_L1_TEX_SHIFT)
 
+#define MMU_MEMORY_L2_SMALL_PAGE_XN         (1 << 0)
 #define MMU_MEMORY_L2_SHAREABLE             (1 << 10)
 #define MMU_MEMORY_L2_NON_GLOBAL            (1 << 11)
 
@@ -199,7 +204,11 @@ __BEGIN_CDECLS
 
 void arm_mmu_early_init(void);
 void arm_mmu_init(void);
+void arm_mmu_init_percpu(void);
 status_t arm_vtop(addr_t va, addr_t *pa);
+
+struct arch_aspace;
+void arm_mmu_chain_load_map(struct arch_aspace *aspace, vaddr_t base, uint count);
 
 /* tlb routines */
 
@@ -227,11 +236,13 @@ static inline void arm_invalidate_tlb_global(void) {
     arm_after_invalidate_tlb_barrier();
 }
 
+/* The uniprocessor form names ASID 0, the only one in use, since TLBIMVAA needs
+ * the multiprocessing extensions, which ARMv6 and Cortex-A8 lack. */
 static inline void arm_invalidate_tlb_mva_no_barrier(vaddr_t va) {
 #if WITH_SMP
     arm_write_tlbimvaais(va & 0xfffff000);
 #else
-    arm_write_tlbimvaa(va & 0xfffff000);
+    arm_write_tlbimva(va & 0xfffff000);
 #endif
 }
 

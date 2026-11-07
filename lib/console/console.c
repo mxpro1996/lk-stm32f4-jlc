@@ -41,7 +41,7 @@
 // writes the split up tokens into, which keeps the two in sync.
 #define MAX_LINE_LEN 1024
 
-#define PANIC_LINE_LEN 32
+#define PANIC_LINE_LEN 80
 
 #define MAX_NUM_ARGS 16
 
@@ -959,7 +959,15 @@ done:
     buffer[pos] = 0;
 }
 
+// cpu running the panic shell, -1 if none
+static int panic_shell_cpu = -1;
+
+bool console_in_panic_shell(void) {
+    return panic_shell_cpu == (int)arch_curr_cpu_num();
+}
+
 void panic_shell_start(void) {
+    panic_shell_cpu = (int)arch_curr_cpu_num();
     dprintf(INFO, "entering panic shell loop\n");
     char input_buffer[PANIC_LINE_LEN];
     console_cmd_args args[MAX_NUM_ARGS];

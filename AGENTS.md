@@ -13,7 +13,7 @@ LK uses a 4-layer modular build system:
      the shared `project/virtual/{test,fs,minip}.mk` fragments and the board's `project/target/*.mk`
    - Projects include other project fragments: `include project/virtual/test.mk`
 
-2. **Target** (`target/*.mk`) - Board-specific configuration combining platform + hardware details
+2. **Target** (`target/<board>/rules.mk`) - Board-specific configuration combining platform + hardware details
    - Defines memory layout: `MEMBASE`, `MEMSIZE`, `KERNEL_BASE`
    - GPIO configs, peripheral addresses for specific boards
 
@@ -170,6 +170,24 @@ USE_RUST=1 scripts/do-qemuriscv -6      # the do-qemu* scripts pick it up from t
 The build output will be written to the `build-<project>/` directory, where `<project>`
 is the name of the project being built.
 
+`BUILDROOT` moves those directories somewhere else, such as a local disk when the tree
+lives on a network share. Set it in the environment and every script follows it:
+`buildall`, `run-qemu-boot-tests.py` (and the FAT/ext2 runners on top of it), the
+`do-qemu*` launchers, the `.exp` test drivers, `check-module-deps.py` and the board
+flashing scripts. The scripts also honor an exported `BUILDDIR_SUFFIX`, the same way make
+does.
+
+```bash
+BUILDROOT=/scratch/lkbuild scripts/buildall -q -e
+BUILDROOT=/scratch/lkbuild ./scripts/run-qemu-boot-tests.py --arch arm64
+BUILDROOT=/scratch/lkbuild scripts/do-qemuarm -6
+```
+
+The scripts read it only from the environment. A `BUILDROOT` passed on the make command
+line, or set with `:=` in `local.mk`, moves make's output but not where the scripts look
+for it. `BUILDROOT ?=` in `local.mk` does nothing, since the top level `makefile` has
+already defaulted it to `.` by then.
+
 Build artifacts include object files, libraries, executables, and generated headers:
 
 - srcfiles.txt - list of source files used in the build
@@ -189,6 +207,9 @@ Build artifacts include object files, libraries, executables, and generated head
 - `<module>/module_config.h` - per-module generated header recording its `MODULE_DEPS` and
   `MODULE_WEAK_DEPS`, which `scripts/check-module-deps.py` reads
 - lk-symtab-pass1.elf / lk-symtab-pass2.elf - intermediate links when `lib/symtab` is in the build
+- compile_commands.json - compilation database for clangd/clang-tidy, joined from the
+  `<object>.o.json` entry each compile rule writes beside its object; `make <project> compdb`
+  symlinks `./compile_commands.json` to it (see `docs/getting_started.md`)
 
 Each module is linked into an ELF intermediate file named `<module>.mod.o` via ld -r.
 The module and object file paths follow the same path structure as the source files.
@@ -247,9 +268,13 @@ The do-qemu* scripts auto-build before launching QEMU. Note they default to `dlm
 # arm-m3, arm-m4, arm-m7, arm-m33 and arm-m55, running on the MPS2/MPS3 boards
 ./scripts/run-qemu-boot-tests.py --arch arm-m55
 
-# x86 has machine/firmware variants alongside the default q35 ones: x86-i440fx,
-# x86-64-i440fx and x86-64-uefi. m68k is also covered. See --help for the full list.
+# x86 has machine/firmware/cpu variants alongside the default q35 ones: x86-i440fx,
+# x86-64-i440fx, x86-64-uefi and x86-64-xapic (no x2apic). m68k is also covered. See
+# --help for the full list.
 ./scripts/run-qemu-boot-tests.py --arch x86-64-uefi
+
+# The other page table geometries: arm64 with 16K and 64K pages, riscv64 with sv39
+./scripts/run-qemu-boot-tests.py --arch arm64-16k --arch arm64-64k --arch riscv64-sv39
 
 # Raise the per-architecture timeout for longer suites. The defaults (90s, 120s for
 # x86-64-uefi) are hang detectors, not performance targets; see the table in the script.
@@ -338,6 +363,27 @@ For in-progress (WIP) work on a branch that is intended to be collapsed or merge
 
 - `WIP [fs][fat]: add mkdir support and tests`
 
+### Keeping documentation current
+
+A change that alters behavior, an API, a build variable, a script flag, a command or where
+files live updates the prose that describes it in the same commit. That prose lives in more
+places than the obvious one:
+
+- `README.md`, this file, and `docs/*.md`
+- per-component READMEs (`lib/uefi/README.md`, `platform/mps2/README.md`,
+  `target/*/README.md`, ...)
+- header comments, module comments and test descriptions
+- `--help`/usage text of the scripts
+
+Search for the old name, flag or path with `rg` across the whole tree rather than trusting
+memory of where it is mentioned, and re-read the surrounding text for statements the change
+made false; appending a new paragraph is not enough. A new document gets a line in
+`docs/index.md`. Finished or abandoned work moves within `docs/todo.md` following the rules
+at the top of that file.
+
+Docs and comments describe the code as it is. The story of a change (what was broken, what
+it used to do) belongs in the commit message, not in a comment or doc.
+
 ### Style enforced by `.clang-format`
 
 - **4 space indentation**, no tabs, no trailing whitespace
@@ -406,6 +452,14 @@ STATIC_COMMAND_END(mytest);
 Console commands are placed in linker section `"console_cmds"` and auto-registered at runtime.
 
 **Note:** If `lib/console` not in build, these macros expand to nothing and the code should not be emitted.
+
+**Panic shell.** Platforms that set `PLATFORM_SUPPORTS_PANIC_SHELL` drop into a polled shell on the
+debug uart after a panic, running with interrupts off and with whatever locks the crashed thread
+held. It only offers commands registered with `STATIC_COMMAND_MASKED(..., CMD_AVAIL_ALWAYS)` (or
+`CMD_AVAIL_PANIC` for panic-only ones). Mark a command that way only if it takes no locks, does not
+allocate and does not block: a mutex asserts there, and anything reached through ACPI takes one. A
+command that normally needs a lock checks `console_in_panic_shell()` to skip it, or to refuse the
+subcommands that cannot work there; `threads`, `heap`, `pmm` and `vm` are examples.
 
 #### Defining Applications
 

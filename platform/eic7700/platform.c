@@ -27,14 +27,29 @@
 
 static const void *fdt;
 
+// The L3 comes out of reset with only way 0 of its 16 enabled as cache, the rest
+// mapped as L3 LIM scratchpad, and nothing in the boot chain enables them (the vendor
+// Linux ccache driver does it itself). WayEnable holds the highest enabled way and
+// can only grow.
+static void l3_enable_ways(void) {
+    const uint32_t config = *REG32(L3_CACHE_BASE_VIRT + 0x0);
+    const uint32_t ways = (config >> 8) & 0xff;
+    const uint32_t enabled = *REG32(L3_CACHE_BASE_VIRT + 0x8) & 0xf;
+    if (ways > 0) {
+        *REG32(L3_CACHE_BASE_VIRT + 0x8) = ways - 1;
+    }
+    dprintf(INFO, "L3: %u banks, %u ways, largest enabled way %u -> %u\n", config & 0xff, ways,
+            enabled, *REG32(L3_CACHE_BASE_VIRT + 0x8) & 0xf);
+}
+
 void platform_early_init(void) {
     // bring the console uart up first, so early output has somewhere to go
     platform_init_uart_early();
 
+    l3_enable_ways();
+
     TRACE;
     // every hart has both an M and an S mode context, so the targets are flat
-    plic_early_init(PLIC_BASE_VIRT, NUM_IRQS, false);
-
     LTRACEF("starting FDT scan\n");
 
     /* look for a flattened device tree in the second arg passed to us */
@@ -51,6 +66,10 @@ void platform_early_init(void) {
 
     // detect secondary cores to start
     fdtwalk_setup_cpus_riscv(fdt);
+
+    // find each hart's PLIC interrupt target, then bring up the PLIC
+    fdtwalk_setup_plic(fdt);
+    plic_early_init(PLIC_BASE_VIRT, NUM_IRQS, false);
 
     // pick up /chosen/bootargs, which is how lk.autorun gets in from U-Boot
     fdtwalk_setup_cmdline(fdt);

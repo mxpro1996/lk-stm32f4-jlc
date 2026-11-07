@@ -26,6 +26,10 @@ ifneq ($(IGNORE_LOCAL_MK),1)
 -include local.mk
 endif
 
+ifneq ($(filter .. ../%,$(LKROOT) $(LKINC)),)
+$(error LKROOT and LKINC must not start with '..' or objects will escape BUILDDIR; symlink the tree into the workspace instead, e.g. ln -s ../lk lk with LKROOT := lk)
+endif
+
 # If one of our goals (from the commandline) happens to have a
 # matching project/goal.mk, then we should re-invoke make with
 # that project name specified...
@@ -243,7 +247,14 @@ CCACHE ?=
 TOOLCHAIN ?= gcc
 
 ifeq ($(TOOLCHAIN),clang)
-    CLANG_BINDIR ?= $(firstword $(wildcard /usr/lib/llvm-*/bin))
+    # The clang on PATH and the tools installed beside it, or failing that the newest
+    # /usr/lib/llvm-N; mixing releases breaks LTO (see the LTO_MODE check below).
+    ifndef CLANG_BINDIR
+        CLANG_BINDIR := $(patsubst %/,%,$(dir $(realpath $(shell which clang 2>/dev/null))))
+        ifeq ($(CLANG_BINDIR),)
+            CLANG_BINDIR := $(lastword $(shell ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V))
+        endif
+    endif
     CLANG_PATH := $(if $(CLANG_BINDIR),$(wildcard $(CLANG_BINDIR)/clang),$(shell which clang 2>/dev/null))
     CLANG_CC := $(if $(CLANG_PATH),$(CLANG_PATH),clang)
     CLANG_TARGET ?= $(CLANG_ARCH_TRIPLE)
@@ -330,6 +341,14 @@ ifneq ($(LTO_MODE),off)
 ifeq ($(COMPILER_TYPE),clang)
 ifneq ($(LINKER_TYPE),lld)
 $(error LTO_MODE=$(LTO_MODE) with TOOLCHAIN=clang requires ld.lld, which has native LTO support; got LD=$(LD))
+endif
+# LTO code generation runs inside ld.lld, which must come from the same LLVM release as the
+# compiler: a newer one can read an older clang's target features differently (LLVM 21 drops
+# M from clang 18's "+m,...,-zmmul") and quietly emit libcalls for every multiply and divide.
+CLANG_MAJOR := $(firstword $(subst ., ,$(shell $(CC) -dumpversion)))
+LLD_MAJOR := $(shell $(LD) --version | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p')
+ifneq ($(CLANG_MAJOR),$(LLD_MAJOR))
+$(error LTO_MODE=$(LTO_MODE) needs clang and ld.lld from the same LLVM release; got clang $(CLANG_MAJOR) and ld.lld $(LLD_MAJOR) ($(LD)), set CLANG_BINDIR)
 endif
 GLOBAL_LTO_COMPILEFLAGS += -flto=$(LTO_MODE)
 else
@@ -480,7 +499,8 @@ $(ALLOBJS): $(GLOBAL_SRCDEPS)
 all:: $(EXTRA_BUILDDEPS)
 
 clean: $(EXTRA_CLEANDEPS)
-	rm -f $(ALLOBJS) $(DEPS) $(GENERATED) $(OUTBIN) $(OUTELF) $(OUTELF).lst $(OUTELF).debug.lst $(OUTELF).sym $(OUTELF).sym.sorted $(OUTELF).size $(OUTELF).hex $(OUTELF).dump
+	rm -f $(ALLOBJS) $(DEPS) $(GENERATED) $(OUTBIN) $(OUTELF) $(OUTELF).lst $(OUTELF).debug.lst $(OUTELF).sym $(OUTELF).sym.sorted $(OUTELF).size $(OUTELF).hex $(OUTELF).dump $(COMPDB)
+	rm -f $(addsuffix .json,$(ALLOBJS))
 
 install: all
 	scp $(OUTBIN) 192.168.0.4:/tftpboot
@@ -489,7 +509,38 @@ tags: $(BUILDDIR)/srcfiles.txt $(BUILDDIR)/include_paths.txt
 	$(info generating tags)
 	@ctags -L $<
 
-.PHONY: all clean install list-arch list-toolchain tags
+# Join the per-object entries the compile recipes wrote into one compilation database
+# for this build. Remade on every build, since the set of objects can change without
+# any of them being rebuilt; the file is only replaced when its contents change.
+# Paths are relative to BUILDDIR to keep the recipe's command line short.
+COMPDB := $(BUILDDIR)/compile_commands.json
+COMPDB_ENTRIES := $(patsubst $(BUILDDIR)/%,%,$(addsuffix .json,$(sort $(ALLOBJS))))
+all:: $(COMPDB)
+
+$(COMPDB): $(ALLOBJS) compdb-force
+	$(info generating $@)
+	@$(MKDIR)
+	$(NOECHO)cd $(BUILDDIR) || exit 1; missing=0; \
+	for f in $(COMPDB_ENTRIES); do \
+		if [ -f $$f ]; then echo $$f; else missing=$$((missing+1)); fi; \
+	done > compile_commands.list; \
+	{ echo '['; xargs cat < compile_commands.list | sed '$$!s/$$/,/'; echo ']'; } > compile_commands.json.tmp; \
+	rm -f compile_commands.list; \
+	$(call TESTANDREPLACEFILE,compile_commands.json.tmp,compile_commands.json) >/dev/null; \
+	if [ $$missing -ne 0 ]; then \
+		echo "warning: $$missing objects in $(BUILDDIR) have no compile command recorded;" \
+			"they were built before compile_commands.json support. 'make $(PROJECT) clean' and rebuild to include them."; \
+	fi
+
+# Point ./compile_commands.json at this build's database, for tools that look for it in
+# the source root. Repoint it by running 'make <project> compdb' for another project.
+compdb: $(COMPDB)
+	$(info linking compile_commands.json -> $(COMPDB))
+	$(NOECHO)ln -sf $(COMPDB) compile_commands.json
+
+compdb-force:
+
+.PHONY: all clean compdb compdb-force install list-arch list-toolchain tags
 
 # generate a config.h file with all of the GLOBAL_DEFINES laid out in #define format
 configheader:

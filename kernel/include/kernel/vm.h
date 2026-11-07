@@ -132,7 +132,7 @@ status_t pmm_add_arena(pmm_arena_t *arena) __NONNULL((1));
 // Returns the number of pages allocated.
 size_t pmm_alloc_pages(uint count, struct list_node *list) __NONNULL((2));
 
-// Allocate a single page
+// Allocate a single page, not on any list.
 vm_page_t *pmm_alloc_page(void);
 
 // Allocate a specific range of physical pages, adding to the tail of the passed list.
@@ -161,8 +161,42 @@ static inline void *pmm_alloc_kpage(void) { return pmm_alloc_kpages(1, NULL); }
 
 size_t pmm_free_kpages(void *ptr, uint count);
 
-// physical to virtual
-void *paddr_to_kvaddr(paddr_t pa);
+// physical to virtual, through the initial mappings that are not temporary
+void *paddr_to_kvaddr_search(paddr_t pa);
+
+// The first initial mapping is the physmap on nearly every platform and takes
+// nearly every lookup, so it is tested inline before the search runs. Page
+// table walkers call this at every level.
+static inline void *paddr_to_kvaddr(paddr_t pa) {
+    const struct mmu_initial_mapping *map = &mmu_initial_mappings[0];
+    if (!(map->flags & MMU_INITIAL_MAPPING_TEMPORARY) && pa - map->phys < map->size) {
+        return (void *)(map->virt + (pa - map->phys));
+    }
+    return paddr_to_kvaddr_search(pa);
+}
+
+// Page table accounting, a test hook for the arch mmu code. One thread at a time
+// is tracked: vm_ptable_track(true) makes it the caller, with its counts at zero
+// and no budget, and vm_ptable_track(false) stops, which the thread must do before
+// it exits. Tables other threads allocate or free are neither counted nor refused.
+//
+// The arch side: each page table allocator calls vm_ptable_budget_take() first and
+// fails if it returns false, and vm_ptable_freed() says how many table pages were
+// handed back. Root tables are not reported when an aspace is destroyed.
+//
+// The test side: vm_ptable_budget_set(n) fails the tracked thread's allocations
+// once n more have gone through, -1 lifts the limit, and vm_ptable_counts() reads
+// how many it has allocated and freed since tracking started.
+#if LK_DEBUGLEVEL > 0
+void vm_ptable_track(bool on);
+void vm_ptable_budget_set(int count);
+void vm_ptable_counts(size_t *allocs, size_t *frees);
+bool vm_ptable_budget_take(void);
+void vm_ptable_freed(size_t count);
+#else
+static inline bool vm_ptable_budget_take(void) { return true; }
+static inline void vm_ptable_freed(size_t count) {}
+#endif
 
 // a hint as to which virtual addresses will be returned by pmm_alloc_kpages
 void *kvaddr_get_range(size_t *size_return);
@@ -221,6 +255,21 @@ struct vmm_aspace *vaddr_to_aspace(void *ptr);
 // reserve a chunk of address space to prevent allocations from that space
 status_t vmm_reserve_space(vmm_aspace_t *aspace, const char *name, size_t size, vaddr_t vaddr)
 __NONNULL((1));
+
+// The lock the vmm holds around every arch_mmu_map/unmap/protect it makes on an
+// aspace. A caller that reaches past the vmm to call those itself holds it across
+// each call, which is how it meets "the caller serializes" in arch/mmu.h. It is
+// not recursive, so nothing in the vmm may be called with it held.
+void vmm_aspace_lock(vmm_aspace_t *aspace) __NONNULL((1));
+void vmm_aspace_unlock(vmm_aspace_t *aspace) __NONNULL((1));
+
+// Reserve size bytes of address space wherever vmm_alloc would place them, aligned
+// to 1 << align_log2, with nothing mapped behind it; returns the base in *va. The
+// caller maps into it with arch_mmu_map() under vmm_aspace_lock(). vmm_free_region()
+// unmaps whatever is still mapped there, but the pages behind it are the caller's.
+status_t vmm_reserve_range(vmm_aspace_t *aspace, const char *name, size_t size,
+                           uint8_t align_log2, vaddr_t *va)
+__NONNULL((1, 5));
 
 // allocate a region of virtual space that maps a physical piece of address space.
 // the physical pages that back this are not allocated from the pmm.

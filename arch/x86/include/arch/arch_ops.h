@@ -65,18 +65,25 @@ static inline uint arch_curr_cpu_num(void) {
 #define wmb() __asm__ volatile("sfence" : : : "memory")
 #else
 // Store to the top of the stack as a load/store barrier. Cannot
-// rely on SS2 being intrinsically available for older i386 class hardware.
+// rely on SSE2 being intrinsically available for older i386 class hardware.
 #define __storeload_barrier __asm__ volatile("lock; addl $0, (%%esp)" : : : "memory", "cc")
 #define mb()                __storeload_barrier
 #define rmb()               __storeload_barrier
 #define wmb()               __storeload_barrier
 #endif
 
-#ifdef WITH_SMP
-// XXX probably too strict
-#define smp_mb()  mb()
-#define smp_rmb() rmb()
-#define smp_wmb() wmb()
+#if WITH_SMP
+// Normal memory is TSO: only a load can pass an earlier store, so smp_mb() is the one that
+// needs an instruction. A locked add is cheaper than mfence and enough for normal memory,
+// which is all the smp variants order (not WC or non-temporal accesses).
+#if ARCH_X86_64
+// below rsp to stay off the line the latest push wrote; harmless since it adds 0
+#define smp_mb()  __asm__ volatile("lock; addl $0, -4(%%rsp)" : : : "memory", "cc")
+#else
+#define smp_mb()  __storeload_barrier
+#endif
+#define smp_rmb() CF
+#define smp_wmb() CF
 #else
 #define smp_mb()  CF
 #define smp_wmb() CF

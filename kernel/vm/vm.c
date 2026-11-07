@@ -8,6 +8,7 @@
 #include <kernel/vm.h>
 
 #include <arch/mmu.h>
+#include <assert.h>
 #include <kernel/thread.h>
 #include <lk/console_cmd.h>
 #include <lk/debug.h>
@@ -87,17 +88,75 @@ static void vm_init_postheap(uint level) {
     }
 }
 
+#if LK_DEBUGLEVEL > 0
+/* the thread whose page tables are counted, NULL for none */
+static thread_t *ptable_thread;
+/* Only that thread reads and writes these: how many more tables it may
+ * allocate, negative for no limit, and how many it has allocated and freed. */
+static int ptable_budget;
+static size_t ptable_allocs;
+static size_t ptable_frees;
+
+static bool ptable_tracked(void) {
+    thread_t *t = __atomic_load_n(&ptable_thread, __ATOMIC_RELAXED);
+    return t && t == get_current_thread();
+}
+
+void vm_ptable_track(bool on) {
+    if (on) {
+        DEBUG_ASSERT(!__atomic_load_n(&ptable_thread, __ATOMIC_RELAXED));
+        ptable_budget = -1;
+        ptable_allocs = 0;
+        ptable_frees = 0;
+    } else {
+        DEBUG_ASSERT(ptable_tracked());
+    }
+    __atomic_store_n(&ptable_thread, on ? get_current_thread() : NULL, __ATOMIC_RELAXED);
+}
+
+void vm_ptable_budget_set(int count) {
+    DEBUG_ASSERT(ptable_tracked());
+    ptable_budget = count;
+}
+
+void vm_ptable_counts(size_t *allocs, size_t *frees) {
+    DEBUG_ASSERT(ptable_tracked());
+    *allocs = ptable_allocs;
+    *frees = ptable_frees;
+}
+
+bool vm_ptable_budget_take(void) {
+    if (!ptable_tracked()) {
+        return true;
+    }
+    if (ptable_budget == 0) {
+        return false;
+    }
+    if (ptable_budget > 0) {
+        ptable_budget--;
+    }
+    ptable_allocs++;
+    return true;
+}
+
+void vm_ptable_freed(size_t count) {
+    if (ptable_tracked()) {
+        ptable_frees += count;
+    }
+}
+#endif
+
 void *kvaddr_get_range(size_t *size_return) {
     *size_return = mmu_initial_mappings->size;
     return (void *)mmu_initial_mappings->virt;
 }
 
-void *paddr_to_kvaddr(paddr_t pa) {
+void *paddr_to_kvaddr_search(paddr_t pa) {
     /* find the mapping of an address in the initial mappings as set up by the
      * arch or platform layers. Any mapping not marked temporary can serve as a
      * hit to return a pointer.
      */
-    struct mmu_initial_mapping *map = mmu_initial_mappings;
+    const struct mmu_initial_mapping *map = mmu_initial_mappings;
     while (map->size > 0) {
         if (!(map->flags & MMU_INITIAL_MAPPING_TEMPORARY) &&
                 pa >= map->phys &&
@@ -126,7 +185,9 @@ vmm_aspace_t *vaddr_to_aspace(void *ptr) {
     if (is_kernel_address((vaddr_t)ptr)) {
         return vmm_get_kernel_aspace();
     } else if (is_user_address((vaddr_t)ptr)) {
-        return get_current_thread()->aspace;
+        // no thread yet, or a kernel thread: nothing to look in
+        thread_t *t = get_current_thread();
+        return t ? t->aspace : NULL;
     } else {
         return NULL;
     }
@@ -142,6 +203,10 @@ usage:
         printf("%s virt2phys <address>\n", argv[0].str);
         printf("%s map <phys> <virt> <count> <flags>\n", argv[0].str);
         printf("%s unmap <virt> <count>\n", argv[0].str);
+        printf("%s protect <virt> <count> <flags>\n", argv[0].str);
+        printf("map flags: 0x8 read (required), 0x10 write, 0x20 execute, 0x4 user,\n");
+        printf("           0x0 cached, 0x1 uncached, 0x2 device\n");
+        printf("protect flags: read, write and execute only\n");
         return ERR_GENERIC;
     }
 
@@ -161,11 +226,23 @@ usage:
 
         paddr_t pa;
         uint flags;
+        /* the crashed thread may hold the aspace lock */
+        const bool lock = !console_in_panic_shell();
+        if (lock) {
+            vmm_aspace_lock(aspace);
+        }
         status_t err = arch_mmu_query(&aspace->arch_aspace, argv[2].u, &pa, &flags);
+        if (lock) {
+            vmm_aspace_unlock(aspace);
+        }
         printf("arch_mmu_query returns %d\n", err);
         if (err >= 0) {
             printf("\tpa 0x%lx, flags 0x%x\n", pa, flags);
         }
+    } else if (console_in_panic_shell()) {
+        printf("%s %s: not available in the panic shell, only phys2virt and virt2phys are\n",
+               argv[0].str, argv[1].str);
+        return ERR_NOT_SUPPORTED;
     } else if (!strcmp(argv[1].str, "map")) {
         if (argc < 6) goto notenoughargs;
 
@@ -175,7 +252,9 @@ usage:
             return -1;
         }
 
-        int err = arch_mmu_map(&aspace->arch_aspace, argv[3].u, argv[2].u, argv[4].u, argv[5].u);
+        vmm_aspace_lock(aspace);
+        status_t err = arch_mmu_map(&aspace->arch_aspace, argv[3].u, argv[2].u, argv[4].u, argv[5].u);
+        vmm_aspace_unlock(aspace);
         printf("arch_mmu_map returns %d\n", err);
     } else if (!strcmp(argv[1].str, "unmap")) {
         if (argc < 4) goto notenoughargs;
@@ -186,8 +265,23 @@ usage:
             return -1;
         }
 
-        int err = arch_mmu_unmap(&aspace->arch_aspace, argv[2].u, argv[3].u);
+        vmm_aspace_lock(aspace);
+        status_t err = arch_mmu_unmap(&aspace->arch_aspace, argv[2].u, argv[3].u);
+        vmm_aspace_unlock(aspace);
         printf("arch_mmu_unmap returns %d\n", err);
+    } else if (!strcmp(argv[1].str, "protect")) {
+        if (argc < 5) goto notenoughargs;
+
+        vmm_aspace_t *aspace = vaddr_to_aspace((void *)argv[2].u);
+        if (!aspace) {
+            printf("ERROR: outside of any address space\n");
+            return -1;
+        }
+
+        vmm_aspace_lock(aspace);
+        status_t err = arch_mmu_protect(&aspace->arch_aspace, argv[2].u, argv[3].u, argv[4].u);
+        vmm_aspace_unlock(aspace);
+        printf("arch_mmu_protect returns %d\n", err);
     } else {
         printf("unknown command\n");
         goto usage;
@@ -198,7 +292,7 @@ usage:
 
 STATIC_COMMAND_START
 #if LK_DEBUGLEVEL > 0
-STATIC_COMMAND("vm", "vm commands", &cmd_vm)
+STATIC_COMMAND_MASKED("vm", "vm commands", &cmd_vm, CMD_AVAIL_ALWAYS)
 #endif
 STATIC_COMMAND_END(vm);
 

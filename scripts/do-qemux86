@@ -12,6 +12,7 @@ function HELP {
     echo "-m <memory in MB>   : memory size (default: 512 MB, 4 MB for legacy)"
     echo "-M <machine>        : QEMU machine type (default: q35; pc for i440fx; ignored with -l)"
     echo "-s <number of cpus> : number of CPUs (default: 1)"
+    echo "-F <feature>        : append a cpu feature to -cpu, e.g. x2apic=off (may be used multiple times)"
     echo "-X                  : print QEMU command and exit (dry run)"
     echo
     echo "-A <cmd line>       : append command line (may be used multiple times)"
@@ -48,8 +49,9 @@ SUDO=""
 DO_DRYRUN=0
 DO_UEFI=0
 MACHINE_OVERRIDE=""
+CPU_FEATURES=""
 
-while getopts A:6d:gf:klm:M:nN:s:tuhVX FLAG; do
+while getopts A:6d:gF:f:klm:M:nN:s:tuhVX FLAG; do
     case $FLAG in
         A) CMDLINE+="${CMDLINE:+ }$(quote_cmdline_arg "$OPTARG")";;
         6) DO_64BIT=1;;
@@ -58,6 +60,7 @@ while getopts A:6d:gf:klm:M:nN:s:tuhVX FLAG; do
             DISK_IMAGES+=("$OPTARG")
             ;;
         g) DO_GRAPHICS=1;;
+        F) CPU_FEATURES+=",$OPTARG";;
         f) DO_V9P=1; DO_V9P_DIR=$OPTARG;;
         k) DO_KVM=1;;
         l) DO_LEGACY=1;;
@@ -164,11 +167,13 @@ if (( DO_VIRTIO )); then
 fi
 
 
+PROJECT_BUILDDIR="$(lk_builddir "$PROJECT")"
+
 ARGS=()
 if (( DO_KVM )); then
-    ARGS+=("-accel" "kvm" "-cpu" "host")
+    ARGS+=("-accel" "kvm" "-cpu" "host${CPU_FEATURES}")
 else
-    ARGS+=("-cpu" "$CPU")
+    ARGS+=("-cpu" "${CPU}${CPU_FEATURES}")
 fi
 ARGS+=("-m" "$MEMSIZE")
 ARGS+=("-smp" "$SMP")
@@ -179,10 +184,10 @@ if (( DO_UEFI )); then
     # carries it (a default EFI/BOOT/BOOTX64.EFI boot gets empty LoadOptions);
     # the ESP contents are staged by prepare_esp below, after the build.
     ARGS+=("-drive" "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}")
-    ARGS+=("-drive" "if=pflash,format=raw,file=build-${PROJECT}/OVMF_VARS.fd")
-    ARGS+=("-drive" "format=raw,file=fat:rw:build-${PROJECT}/esp")
+    ARGS+=("-drive" "if=pflash,format=raw,file=${PROJECT_BUILDDIR}/OVMF_VARS.fd")
+    ARGS+=("-drive" "format=raw,file=fat:rw:${PROJECT_BUILDDIR}/esp")
 else
-    ARGS+=("-kernel" "build-${PROJECT}/lk.elf")
+    ARGS+=("-kernel" "${PROJECT_BUILDDIR}/lk.elf")
 
     if [[ -n "$CMDLINE" ]]; then
         ARGS+=("-append" "$CMDLINE")
@@ -269,17 +274,17 @@ CMD+=("$@")
 # the build so lk.efi exists
 function prepare_esp {
     (( DO_UEFI )) || return 0
-    local esp="build-${PROJECT}/esp"
+    local esp="${PROJECT_BUILDDIR}/esp"
     rm -rf "$esp"
     mkdir -p "$esp"
     # fresh NVRAM every run so stale Boot#### entries don't redirect the boot
-    cp "$OVMF_VARS" "build-${PROJECT}/OVMF_VARS.fd"
+    cp "$OVMF_VARS" "${PROJECT_BUILDDIR}/OVMF_VARS.fd"
     if [[ -n "$CMDLINE" ]]; then
-        cp "build-${PROJECT}/lk.efi" "$esp/lk.efi"
+        cp "${PROJECT_BUILDDIR}/lk.efi" "$esp/lk.efi"
         printf 'echo -off\n\\lk.efi %s\n' "$CMDLINE" > "$esp/startup.nsh"
     else
         mkdir -p "$esp/EFI/BOOT"
-        cp "build-${PROJECT}/lk.efi" "$esp/EFI/BOOT/BOOTX64.EFI"
+        cp "${PROJECT_BUILDDIR}/lk.efi" "$esp/EFI/BOOT/BOOTX64.EFI"
     fi
 }
 

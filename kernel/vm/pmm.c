@@ -149,7 +149,7 @@ vm_page_t *pmm_alloc_page(void) {
 
     DEBUG_ASSERT(ret == 1);
 
-    return list_peek_head_type(&list, vm_page_t, node);
+    return list_remove_head_type(&list, vm_page_t, node);
 }
 
 size_t pmm_alloc_range(paddr_t address, uint count, struct list_node *list) {
@@ -248,6 +248,9 @@ void *pmm_alloc_kpages(uint count, struct list_node *list) {
         vm_page_t *p = pmm_alloc_page();
         if (!p) {
             return NULL;
+        }
+        if (list) {
+            list_add_tail(list, &p->node);
         }
 
         return paddr_to_kvaddr(vm_page_to_paddr(p));
@@ -421,6 +424,10 @@ usage:
         list_for_every_entry(&arena_list, a, pmm_arena_t, node) {
             dump_arena(a, false);
         }
+    } else if (console_in_panic_shell()) {
+        printf("%s %s: not available in the panic shell, only arenas is\n", argv[0].str,
+               argv[1].str);
+        return ERR_NOT_SUPPORTED;
     } else if (!strcmp(argv[1].str, "alloc")) {
         if (argc < 3) goto notenoughargs;
 
@@ -499,7 +506,7 @@ usage:
 
 STATIC_COMMAND_START
 #if LK_DEBUGLEVEL > 0
-STATIC_COMMAND("pmm", "physical memory manager", &cmd_pmm)
+STATIC_COMMAND_MASKED("pmm", "physical memory manager", &cmd_pmm, CMD_AVAIL_ALWAYS)
 #endif
 STATIC_COMMAND_END(pmm);
 

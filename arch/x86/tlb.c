@@ -7,6 +7,7 @@
  */
 
 #include <arch/x86.h>
+#include <arch/x86/feature.h>
 #include <arch/x86/mmu.h>
 #include <kernel/mp.h>
 #include <lk/trace.h>
@@ -26,14 +27,17 @@ static void x86_tlb_shootdown_task(void *arg) {
 
     if (args->count > X86_TLB_SHOOTDOWN_MAX_PAGES) {
         /* Reloading cr3 leaves global entries alone, and kernel pages are
-         * global, so turn PGE off and on around it when it is in use. */
-        ulong cr4 = x86_get_cr4();
-        if (cr4 & X86_CR4_PGE) {
-            x86_set_cr4(cr4 & ~X86_CR4_PGE);
-            x86_set_cr4(cr4);
-        } else {
-            x86_set_cr3(x86_get_cr3());
+         * global, so turn PGE off and on around it when it is in use. A cpu
+         * without PGE may have no cr4 at all. */
+        if (x86_feature_test(X86_FEATURE_PGE)) {
+            ulong cr4 = x86_get_cr4();
+            if (cr4 & X86_CR4_PGE) {
+                x86_set_cr4(cr4 & ~X86_CR4_PGE);
+                x86_set_cr4(cr4);
+                return;
+            }
         }
+        x86_set_cr3(x86_get_cr3());
         return;
     }
 
@@ -48,8 +52,17 @@ void x86_tlb_shootdown(vaddr_t vaddr, uint count) {
 
     LTRACEF("vaddr %#lx count %u\n", vaddr, count);
 
-    /* Every cpu, the local one included: it may have moved since the local
-     * invalidates the unmap itself did. invlpg on a cpu running another aspace
-     * only drops a translation that would be refilled anyway. */
+#if WITH_SMP
+    /* mp_sync_exec() only reaches cpus that have joined the scheduler. A cpu
+     * that has not, the boot cpu through most of init, maps and unmaps all the
+     * same; its thread cannot move off it, so it runs the task here. */
+    if (!mp_is_cpu_active(arch_curr_cpu_num())) {
+        x86_tlb_shootdown_task(&args);
+    }
+#endif
+
+    /* Every active cpu, the local one included: the caller may have moved
+     * since it changed the tables. invlpg on a cpu running another aspace only
+     * drops a translation that would be refilled anyway. */
     mp_sync_exec(MP_IPI_TARGET_ALL, 0, x86_tlb_shootdown_task, &args);
 }

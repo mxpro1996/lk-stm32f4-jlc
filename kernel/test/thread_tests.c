@@ -21,9 +21,12 @@
 #include <rand.h>
 #include <arch/atomic.h>
 #include <kernel/event.h>
+#include <kernel/mp.h>
 #include <kernel/mutex.h>
 #include <kernel/semaphore.h>
 #include <kernel/thread.h>
+#include <kernel/timer.h>
+#include <platform.h>
 
 /* -------------------------------------------------------------------------- */
 /* mutex                                                                       */
@@ -452,6 +455,244 @@ static bool test_thread_detach(void) {
     END_TEST;
 }
 
+static bool test_thread_pin_cpu(void) {
+    BEGIN_TEST;
+
+#if WITH_SMP
+    thread_t *self = get_current_thread();
+    const int old_pin = thread_pinned_cpu(self);
+
+    for (uint cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        if (!mp_is_cpu_active(cpu)) {
+            continue;
+        }
+        thread_set_pinned_cpu(self, cpu);
+        EXPECT_EQ(cpu, arch_curr_cpu_num(), "thread_set_pinned_cpu did not migrate to pinned cpu");
+    }
+
+    thread_set_pinned_cpu(self, old_pin);
+#endif
+
+    END_TEST;
+}
+
+#if WITH_SMP
+struct pin_cpu_update_state {
+    event_t ready;
+    bool stop;
+};
+
+static int pin_cpu_update_blocker(void *arg) {
+    struct pin_cpu_update_state *state = arg;
+    event_signal(&state->ready, false);
+    while (!__atomic_load_n(&state->stop, __ATOMIC_ACQUIRE)) {
+        arch_spinloop_pause();
+    }
+    return 0;
+}
+
+static int pin_cpu_update_tester(void *arg) {
+    thread_set_pinned_cpu(get_current_thread(), (int)(intptr_t)arg);
+    return arch_curr_cpu_num();
+}
+#endif
+
+static bool test_thread_pin_cpu_update(void) {
+    BEGIN_TEST;
+
+#if WITH_SMP
+    const int cpu = arch_curr_cpu_num();
+    const mp_cpu_mask_t others = mp_get_active_mask() & ~(1U << cpu);
+    if (!others) {
+        unittest_printf("only one CPU is active; skipping queued affinity update test\n");
+        END_TEST;
+    }
+    const uint target_cpu = __builtin_ctz(others);
+
+    struct pin_cpu_update_state update = {};
+    thread_t *blocker = thread_create("pin blocker", &pin_cpu_update_blocker, &update,
+                                      HIGHEST_PRIORITY, DEFAULT_STACK_SIZE);
+    ASSERT_NONNULL(blocker, "could not create pin blocker thread");
+    event_init(&update.ready, false, 0);
+    thread_set_pinned_cpu(blocker, target_cpu);
+
+    thread_t *self = get_current_thread();
+    const int old_pin = thread_pinned_cpu(self);
+    const int old_priority = self->priority;
+    thread_set_pinned_cpu(self, cpu);
+    thread_set_priority(DEFAULT_PRIORITY);
+    thread_resume(blocker);
+    event_wait(&update.ready);
+
+    const int updated_pins[] = {cpu, -1};
+    for (uint i = 0; i < countof(updated_pins); i++) {
+        thread_t *t = thread_create("pin update", &pin_cpu_update_tester,
+                                    (void *)(intptr_t)target_cpu,
+                                    HIGHEST_PRIORITY - 1, DEFAULT_STACK_SIZE);
+        EXPECT_NONNULL(t, "could not create pin update thread");
+        if (!t) {
+            break;
+        }
+        thread_set_pinned_cpu(t, cpu);
+
+        // The worker outranks us and starts migrating before we run again.
+        // The blocker outranks the worker on its active destination CPU, keeping
+        // it queued until we repin or unpin it, without relying on timing.
+        thread_resume(t);
+        THREAD_LOCK(state);
+        bool queued = t->state == THREAD_READY && thread_pinned_cpu(t) == (int)target_cpu;
+        THREAD_UNLOCK(state);
+        EXPECT_TRUE(queued, "worker did not wait for its affinity update");
+
+        thread_set_pinned_cpu(t, updated_pins[i]);
+        int resumed_cpu = -1;
+        EXPECT_EQ(NO_ERROR, thread_join(t, &resumed_cpu, INFINITE_TIME), "thread_join failed");
+        EXPECT_TRUE(resumed_cpu >= 0 && resumed_cpu < SMP_MAX_CPUS &&
+                    mp_is_cpu_active(resumed_cpu), "worker did not resume on an active CPU");
+        if (updated_pins[i] >= 0) {
+            EXPECT_EQ(updated_pins[i], resumed_cpu, "worker ignored its updated affinity");
+        }
+    }
+
+    __atomic_store_n(&update.stop, true, __ATOMIC_RELEASE);
+    EXPECT_EQ(NO_ERROR, thread_join(blocker, NULL, INFINITE_TIME), "blocker join failed");
+    event_destroy(&update.ready);
+    thread_set_priority(old_priority);
+    thread_set_pinned_cpu(self, old_pin);
+#endif
+
+    END_TEST;
+}
+
+#if WITH_SMP
+static int pin_sleeper_thread(void *arg) {
+    thread_sleep(100);
+    return (int)arch_curr_cpu_num();
+}
+#endif
+
+// Repin a sleeping thread to an idle CPU. Its sleep timer still fires on the
+// CPU it fell asleep on, which then has to wake the new one.
+static bool test_thread_pin_sleeping(void) {
+    BEGIN_TEST;
+
+#if WITH_SMP
+    thread_t *self = get_current_thread();
+    const int old_pin = thread_pinned_cpu(self);
+    const uint home = arch_curr_cpu_num();
+    const mp_cpu_mask_t others = mp_get_active_mask() & ~(1U << home);
+    if (!others) {
+        unittest_printf("only one CPU is active; skipping pinned sleeper test\n");
+        END_TEST;
+    }
+    const uint sleep_cpu = __builtin_ctz(others);
+
+    // Stay on home, so it is idle while we wait in thread_join() below.
+    thread_set_pinned_cpu(self, home);
+
+    // Retry if the sleeper wakes up before we get to repin it.
+    bool repinned_asleep = false;
+    for (int attempt = 0; attempt < 3 && !repinned_asleep; attempt++) {
+        thread_t *t = thread_create("pin sleeper", &pin_sleeper_thread, NULL,
+                                    DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+        EXPECT_NONNULL(t, "could not create sleeper thread");
+        if (!t) {
+            break;
+        }
+        thread_set_pinned_cpu(t, sleep_cpu);
+        thread_resume(t);
+
+        bool asleep = false;
+        for (int i = 0; i < 50 && !asleep; i++) {
+            thread_sleep(1);
+            THREAD_LOCK(state);
+            asleep = t->state == THREAD_SLEEPING;
+            THREAD_UNLOCK(state);
+        }
+        thread_set_pinned_cpu(t, home);
+        {
+            THREAD_LOCK(state);
+            repinned_asleep = asleep && t->state == THREAD_SLEEPING;
+            THREAD_UNLOCK(state);
+        }
+
+        int ran_on = -1;
+        status_t err = thread_join(t, &ran_on, repinned_asleep ? 1000 : INFINITE_TIME);
+        if (repinned_asleep) {
+            EXPECT_EQ(NO_ERROR, err, "sleeping thread repinned to an idle CPU never ran");
+            if (err != NO_ERROR) {
+                // It is still queued for home; blocking here lets home run it.
+                thread_join(t, &ran_on, INFINITE_TIME);
+            }
+            EXPECT_EQ((int)home, ran_on, "sleeper did not run on its new CPU");
+        }
+    }
+    EXPECT_TRUE(repinned_asleep, "sleeper kept waking up before it could be repinned");
+
+    thread_set_pinned_cpu(self, old_pin);
+#endif
+
+    END_TEST;
+}
+
+static enum handler_return timer_cancel_test_cb(timer_t *timer, lk_time_t now, void *arg) {
+    event_t *evt = (event_t *)arg;
+    event_signal(evt, false);
+    return INT_RESCHEDULE;
+}
+
+static bool test_timer_cancel_past_due_newhead(void) {
+    BEGIN_TEST;
+
+    thread_t *self = get_current_thread();
+    int old_pinned = thread_pinned_cpu(self);
+    thread_set_pinned_cpu(self, 0);
+
+    /* Freshly reschedule after a sleep so preempt_timer[0] is armed ~10ms out
+     * and will not sit ahead of our 1ms test timers. */
+    thread_sleep(1);
+
+    event_t evt1;
+    event_t evt2;
+    event_init(&evt1, false, 0);
+    event_init(&evt2, false, 0);
+
+    timer_t t1 = TIMER_INITIAL_VALUE(t1);
+    timer_t t2 = TIMER_INITIAL_VALUE(t2);
+
+    /* Align to ~500us into a 1ms tick so that a 1ms oneshot hardware countdown
+     * expires ~500us after current_time() increments to t0 + 1. */
+    lk_time_t t0 = current_time();
+    while (current_time() == t0) {
+    }
+    t0 = current_time();
+    lk_bigtime_t hires0 = current_time_hires();
+    while (current_time_hires() - hires0 < 500) {
+    }
+
+    timer_set_oneshot(&t1, 1, timer_cancel_test_cb, &evt1);
+    timer_set_oneshot(&t2, 1, timer_cancel_test_cb, &evt2);
+
+    /* Wait for current_time() to reach t1/t2's scheduled_time (t0 + 1) before
+     * the ~1ms hardware countdown initiated at t0 + 0.5ms finishes. */
+    while (current_time() == t0) {
+    }
+
+    /* Cancelling the head timer t1 now promotes t2 to the head with
+     * t2.scheduled_time <= current_time() (delay == 0). t2 must still fire. */
+    timer_cancel(&t1);
+
+    status_t err = event_wait_timeout(&evt2, 100);
+    EXPECT_EQ(NO_ERROR, err, "second timer did not fire after cancelling head timer");
+
+    timer_cancel(&t2);
+    event_destroy(&evt1);
+    event_destroy(&evt2);
+    thread_set_pinned_cpu(self, old_pinned);
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(thread_tests)
 RUN_TEST(test_mutex_static_init);
 RUN_TEST(test_mutex_mutual_exclusion);
@@ -465,4 +706,8 @@ RUN_TEST(test_atomic_add);
 RUN_TEST(test_thread_join);
 RUN_TEST(test_thread_join_after_exit);
 RUN_TEST(test_thread_detach);
+RUN_TEST(test_thread_pin_cpu);
+RUN_TEST(test_thread_pin_cpu_update);
+RUN_TEST(test_thread_pin_sleeping);
+RUN_TEST(test_timer_cancel_past_due_newhead);
 END_TEST_CASE(thread_tests)

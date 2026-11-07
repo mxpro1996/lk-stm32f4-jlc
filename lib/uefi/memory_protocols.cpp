@@ -21,7 +21,9 @@
 #include <arch/mmu.h>
 #include <kernel/vm.h>
 #include <lib/dlmalloc.h>
+#include <lk/err.h>
 #include <lk/trace.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -29,6 +31,7 @@
 #include <uefi/protocols/gbl_efi_boot_memory_protocol.h>
 #include <uefi/types.h>
 
+#include "image_permissions.h"
 #include "uefi_platform.h"
 
 #define LOCAL_TRACE 0
@@ -114,8 +117,12 @@ __WEAK void *alloc_page(size_t size, size_t align_log2) {
     printf("Failed to allocate physical memory size %zu\n", size);
     return nullptr;
   }
-  int ret = arch_mmu_map(&aspace->arch_aspace, pa, pa, size / PAGE_SIZE, 0);
-  if (ret != 0) {
+  // General UEFI allocations (including heap and stack) are writable, not executable.
+  vmm_aspace_lock(aspace);
+  status_t ret = arch_mmu_map(&aspace->arch_aspace, pa, pa, size / PAGE_SIZE,
+                              ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
+  vmm_aspace_unlock(aspace);
+  if (ret != NO_ERROR) {
     printf("Failed to arch_mmu_map(0x%lx)\n", pa);
     return nullptr;
   }
@@ -134,29 +141,41 @@ __WEAK void *alloc_page(void *addr, size_t size, size_t align_log2) {
   }
   auto aspace = set_boot_aspace();
   size = ROUNDUP(size, PAGE_SIZE);
-  struct list_node list;
-  size_t allocated =
-      pmm_alloc_range(reinterpret_cast<paddr_t>(addr), size, &list);
-  if (allocated != size / PAGE_SIZE) {
+  const uint page_count = static_cast<uint>(size / PAGE_SIZE);
+  struct list_node pages;
+  list_initialize(&pages);
+  size_t allocated = pmm_alloc_range(reinterpret_cast<paddr_t>(addr),
+                                     page_count, &pages);
+  if (allocated != page_count) {
+    pmm_free(&pages);
     printf(
         "Failed to allocate physical memory size %zu at specified address %p "
         "fallback to regular allocation\n",
         size, addr);
     return alloc_page(size, align_log2);
   }
-  status_t err{};
-  err = vmm_reserve_space(aspace, "uefi_program", size,
-                          reinterpret_cast<vaddr_t>(addr));
-  if (err) {
-    printf("Failed to vmm_reserve_space for uefi program %d\n", err);
+
+  void *mapped_addr = addr;
+  status_t err = vmm_alloc_physical(
+      aspace, "uefi_program", size, &mapped_addr, align_log2,
+      reinterpret_cast<paddr_t>(addr), VMM_FLAG_VALLOC_SPECIFIC,
+      ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
+  if (err != NO_ERROR) {
+    pmm_free(&pages);
+    printf("Failed to map physical memory at %p for uefi program %d\n", addr,
+           err);
     return nullptr;
   }
-  return addr;
+
+  // vmm_alloc_physical() does not own PMM pages. Unlink them from this stack
+  // list; free_pages() reconstructs and releases the list after unmapping.
+  while (list_remove_head(&pages)) {}
+  return mapped_addr;
 }
 
 EfiStatus allocate_pages(EfiAllocatorType type, EfiMemoryType memory_type,
                          size_t pages, EfiPhysicalAddr *memory) {
-  if (memory == nullptr) {
+  if (memory == nullptr || pages == 0 || pages > SIZE_MAX / PAGE_SIZE) {
     return EFI_STATUS_INVALID_PARAMETER;
   }
   if (type == EFI_ALLOCATOR_TYPE_ALLOCATE_MAX_ADDRESS && *memory < 0xFFFFFFFF) {
@@ -164,10 +183,29 @@ EfiStatus allocate_pages(EfiAllocatorType type, EfiMemoryType memory_type,
             *memory);
     return EFI_STATUS_UNSUPPORTED;
   }
-  *memory = reinterpret_cast<EfiPhysicalAddr>(alloc_page(pages * PAGE_SIZE));
-  if (*memory == 0) {
+  void *allocation = alloc_page(pages * PAGE_SIZE);
+  if (!allocation) {
     return EFI_STATUS_OUT_OF_RESOURCES;
   }
+  // EFI clients write or relocate code after AllocatePages() returns. Without
+  // EFI_MEMORY_ATTRIBUTE_PROTOCOL there is no later RW -> RX transition, so
+  // these three code types must remain writable and executable for now.
+  if (arch_mmu_supports_nx_mappings() &&
+      (memory_type == EFI_MEMORY_TYPE_LOADER_CODE ||
+       memory_type == EFI_MEMORY_TYPE_BOOT_SERVICES_CODE ||
+       memory_type == EFI_MEMORY_TYPE_RUNTIME_SERVICES_CODE)) {
+    auto *aspace = set_boot_aspace();
+    vmm_aspace_lock(aspace);
+    const status_t status = arch_mmu_protect(
+        &aspace->arch_aspace, reinterpret_cast<vaddr_t>(allocation), pages,
+        ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_PERM_EXECUTE);
+    vmm_aspace_unlock(aspace);
+    if (status != NO_ERROR) {
+      free_pages(allocation, pages);
+      return EFI_STATUS_OUT_OF_RESOURCES;
+    }
+  }
+  *memory = reinterpret_cast<EfiPhysicalAddr>(allocation);
   return EFI_STATUS_SUCCESS;
 }
 
@@ -197,34 +235,15 @@ __WEAK EfiStatus free_pool(void *mem) {
 }
 
 __WEAK EfiStatus free_pages(void *memory, size_t pages) {
-  auto pa = vaddr_to_paddr(memory);
-  if (pa != reinterpret_cast<paddr_t>(memory)) {
-    printf("WARN: virtual address %p is not identity mapped, physical addr: "
-           "%p\n",
-           memory, reinterpret_cast<void *>(pa));
-  }
-  // pmm_free_kpages expects a kernel virtual address. Keep the permanent
-  // kernel mapping before removing the UEFI identity mapping below.
-  auto kernel_memory = paddr_to_kvaddr(pa);
-  if (kernel_memory == nullptr) {
-    printf("Failed to find kernel mapping for physical pages %p %zu\n",
-           reinterpret_cast<void *>(pa), pages);
-    return EFI_STATUS_DEVICE_ERROR;
-  }
-  status_t err =
-      vmm_free_region(set_boot_aspace(), reinterpret_cast<vaddr_t>(memory));
-  if (err) {
-    printf("%s err:%d memory [%p] pages:%zu\n", __FUNCTION__, err, memory,
-           pages);
-    return EFI_STATUS_DEVICE_ERROR;
-  }
-  auto pages_freed = pmm_free_kpages(kernel_memory, pages);
-  if (pages_freed != pages) {
-    printf("Failed to free physical pages %p %zu, only freed %zu pages\n",
-           reinterpret_cast<void *>(pa), pages, pages_freed);
-    return EFI_STATUS_DEVICE_ERROR;
-  }
-  return EFI_STATUS_SUCCESS;
+  return free_uefi_image(memory, pages);
+}
+
+__WEAK void *alloc_uefi_stack(size_t size) {
+  return alloc_page(size, 23);
+}
+
+__WEAK void free_uefi_stack(void *stack, size_t size) {
+  free_pages(stack, ROUNDUP(size, PAGE_SIZE) / PAGE_SIZE);
 }
 
 EfiStatus get_physical_memory_map(size_t *memory_map_size,

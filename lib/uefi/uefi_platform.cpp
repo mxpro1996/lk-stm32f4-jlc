@@ -26,7 +26,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <uefi/protocols/erase_block_protocol.h>
-#include <uefi/protocols/gbl_efi_image_loading_protocol.h>
 #include <uefi/protocols/gbl_efi_os_configuration_protocol.h>
 #include <uefi/protocols/gbl_efi_avb_protocol.h>
 #include <uefi/protocols/gbl_efi_boot_control_protocol.h>
@@ -39,7 +38,12 @@
 #define LOCAL_TRACE 0
 
 __WEAK EfiStatus efi_dt_fixup(struct EfiDtFixupProtocol* self, void* fdt,
-                              size_t* buffer_size, uint32_t flags) {
+                              size_t* buffer_size) {
+  auto ret = fdt_open_into(fdt, fdt, *buffer_size);
+  if (ret < 0) {
+    printf("Failed to open FDT %d\n", ret);
+    return EFI_STATUS_INVALID_PARAMETER;
+  }
   auto offset = fdt_subnode_offset(fdt, 0, "chosen");
   if (offset < 0) {
     printf("Failed to find chosen node %d\n", offset);
@@ -52,20 +56,21 @@ __WEAK EfiStatus efi_dt_fixup(struct EfiDtFixupProtocol* self, void* fdt,
     printf("Failed to find chosen/bootargs prop\n");
     return EFI_STATUS_SUCCESS;
   }
-  char* new_prop_data = reinterpret_cast<char*>(malloc(length));
+  static constexpr auto&& to_add =
+      "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 ";
+  const size_t new_length = length + sizeof(to_add) - 1;
+  char* new_prop_data = reinterpret_cast<char*>(malloc(new_length));
   DEFER {
     free(new_prop_data);
     new_prop_data = nullptr;
   };
   auto prop_length = strnlen(prop->data, length);
-  static constexpr auto&& to_add =
-      "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 ";
-  memset(new_prop_data, 0, length);
+  memset(new_prop_data, 0, new_length);
   memcpy(new_prop_data, to_add, sizeof(to_add) - 1);
   memcpy(new_prop_data + sizeof(to_add) - 1, prop->data, prop_length);
-  auto ret = fdt_setprop(fdt, offset, "bootargs", new_prop_data, length);
+  ret = fdt_setprop(fdt, offset, "bootargs", new_prop_data, new_length);
 
-  printf("chosen/bootargs: %d %d \"%s\"\n", ret, length, new_prop_data);
+  printf("chosen/bootargs: %d %zu \"%s\"\n", ret, new_length, new_prop_data);
 
   return EFI_STATUS_SUCCESS;
 }
@@ -75,16 +80,17 @@ __WEAK EfiStatus fixup_bootconfig(struct GblEfiOsConfigurationProtocol* self,
                                   size_t bootconfig_size,
                                   const uint8_t* bootconfig,
                                   size_t* fixup_buffer_size, uint8_t* fixup) {
-  printf("%s(%p, %s, %lu, %lu)\n", __FUNCTION__, self,
+  printf("%s(%p, %.*s, %lu, %lu)\n", __FUNCTION__, self,
+         static_cast<int>(bootconfig_size),
          reinterpret_cast<const char*>(bootconfig), bootconfig_size,
          *fixup_buffer_size);
   constexpr auto&& to_add =
       "\nandroidboot.fstab_suffix=cf.f2fs."
       "hctr2\nandroidboot.boot_devices=4010000000.pcie";
-  const auto final_len = sizeof(to_add);
+  const auto final_len = sizeof(to_add) - 1;
   if (final_len > *fixup_buffer_size) {
     *fixup_buffer_size = final_len;
-    return EFI_STATUS_OUT_OF_RESOURCES;
+    return EFI_STATUS_BUFFER_TOO_SMALL;
   }
   *fixup_buffer_size = final_len;
   memcpy(fixup, to_add, final_len);
@@ -134,8 +140,16 @@ __WEAK EfiStatus select_device_trees(struct GblEfiOsConfigurationProtocol* self,
 __WEAK EfiStatus select_fit_configuration(
     struct GblEfiOsConfigurationProtocol* self, size_t fit_size, const uint8_t* fit,
     size_t metadata_size, const uint8_t* metadata, size_t* selected_configuration_offset) {
-  printf("%s(%p, %lu, %p, %lu, %p, %p)\n", __FUNCTION__, self, fit_size, fit, metadata_size,
-         metadata, selected_configuration_offset);
+  LTRACEF("%s(%p, %lu, %p, %lu, %p, %p)\n", __FUNCTION__, self, fit_size, fit, metadata_size,
+          metadata, selected_configuration_offset);
+  return EFI_STATUS_UNSUPPORTED;
+}
+
+__WEAK EfiStatus fixup_kernel_commandline(
+    struct GblEfiOsConfigurationProtocol* self, size_t commandline_size,
+    const EfiChar8* commandline, size_t* fixup_buffer_size, EfiChar8* fixup) {
+  LTRACEF("%s(%p, %lu, %p, %p, %p)\n", __FUNCTION__, self, commandline_size,
+          commandline, fixup_buffer_size, fixup);
   return EFI_STATUS_UNSUPPORTED;
 }
 

@@ -22,7 +22,6 @@
 #include <uefi/protocols/gbl_efi_avb_protocol.h>
 #include <uefi/protocols/gbl_efi_boot_control_protocol.h>
 #include <uefi/protocols/gbl_efi_boot_memory_protocol.h>
-#include <uefi/protocols/gbl_efi_image_loading_protocol.h>
 #include <uefi/protocols/gbl_efi_os_configuration_protocol.h>
 #include <uefi/protocols/random_number_generator_protocol.h>
 #include <uefi/protocols/timestamp.h>
@@ -34,7 +33,7 @@
 // is weakly linked.
 
 EfiStatus efi_dt_fixup(struct EfiDtFixupProtocol* self, void* fdt,
-                       size_t* buffer_size, uint32_t flags);
+                       size_t* buffer_size);
 
 EfiStatus fixup_bootconfig(struct GblEfiOsConfigurationProtocol* self,
                            size_t bootconfig_size, const uint8_t* bootconfig,
@@ -48,6 +47,10 @@ EfiStatus select_fit_configuration(
     struct GblEfiOsConfigurationProtocol* self, size_t fit_size, const uint8_t* fit,
     size_t metadata_size, const uint8_t* metadata, size_t* selected_configuration_offset);
 
+EfiStatus fixup_kernel_commandline(
+    struct GblEfiOsConfigurationProtocol* self, size_t commandline_size,
+    const EfiChar8* commandline, size_t* fixup_buffer_size, EfiChar8* fixup);
+
 EfiStatus exit_boot_services(EfiHandle image_handle, size_t map_key);
 
 EfiStatus platform_setup_system_table(EfiSystemTable *table);
@@ -60,16 +63,23 @@ EfiStatus get_timestamp_properties(EfiTimestampProperties *properties);
 EfiStatus set_watchdog_timer(size_t timeout, uint64_t watchdog_code,
                              size_t data_size, uint16_t* watchdog_data);
 
-// alloc_page/free_pages is implemented in memory_protocols.cpp
+// alloc_page/free_pages is implemented in memory_protocols.cpp. The fixed-
+// address overload is retained as a weak platform hook (and tested by
+// uefi_memory_protocols); the PE loader uses the non-weak
+// alloc_uefi_image()/free_uefi_image() pair instead.
 void *alloc_page(void *addr, size_t size, size_t align_log2 = PAGE_SIZE_SHIFT);
 
 void *alloc_page(size_t size, size_t align_log2 = PAGE_SIZE_SHIFT);
 
 EfiStatus free_pages(void *memory, size_t pages);
 
-EfiStatus get_buffer(struct GblEfiImageLoadingProtocol *self,
-                     const GblEfiImageInfo *ImageInfo,
-                     GblEfiImageBuffer *Buffer);
+// Override both hooks to use a platform-specific UEFI application stack.
+// The default allocates an identity-mapped stack with alloc_page(). Platforms
+// may instead use kernel-aspace memory, provided the stack remains writable
+// and mapped throughout the application call. The returned base must be
+// 16-byte aligned; size is the allocation size passed to the matching free.
+void *alloc_uefi_stack(size_t size);
+void free_uefi_stack(void *stack, size_t size);
 
 // uefi_malloc is used by LK to allocate memory that would be used by UEFI
 // applications

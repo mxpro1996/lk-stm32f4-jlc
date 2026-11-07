@@ -120,7 +120,8 @@ static int free_completed_pbuf_frames(void) {
             pktbuf_t *p = list_remove_head_type(&gem.queued_pbufs, pktbuf_t, list);
             DEBUG_ASSERT(p);
             eof = p->flags & PKTBUF_FLAG_EOF;
-            ret += pktbuf_free(p, false);
+            pktbuf_free(p, false);
+            ret++;
         } while (!eof);
 
         gem.tx_tail = (gem.tx_tail + 1) % GEM_TX_DESC_CNT;
@@ -279,7 +280,7 @@ static status_t gem_cfg_buffer_descs(void) {
 
     if ((ret = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "gem_rx_bufs",
                                     GEM_RX_DESC_CNT * GEM_RX_BUF_SIZE,  (void **) &rx_buf_vaddr, 0, 0,
-                                    ARCH_MMU_FLAG_CACHED)) < 0) {
+                                    ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE)) < 0) {
         return ret;
     }
 
@@ -442,7 +443,8 @@ status_t gem_init(uintptr_t gem_base) {
 
     /* allocate a block of uncached contiguous memory for the peripheral descriptors */
     if ((ret = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "gem_desc",
-                                    sizeof(*gem.descs), &descs_vaddr, 0, 0, ARCH_MMU_FLAG_UNCACHED_DEVICE)) < 0) {
+                                    sizeof(*gem.descs), &descs_vaddr, 0, 0,
+                                    ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_UNCACHED_DEVICE)) < 0) {
         return ret;
     }
     descs_paddr = vaddr_to_paddr((void *)descs_vaddr);
@@ -537,27 +539,8 @@ static int cmd_gem(int argc, const console_cmd_args *argv) {
     thread_t *stat_thread;
 
     if (argc == 1) {
-        printf("gem raw <iter> <length>: Send <iter> raw mac packet for testing\n");
-        printf("gem rx_debug:      toggle RX debug output\n");
         printf("gem stats          toggle periodic output of driver stats\n");
         printf("gem status:        print driver status\n");
-    } else if (strncmp(argv[1].str, "rx_debug", sizeof("rx_debug")) == 0) {
-        pktbuf_t *p;
-        int iter;
-        if (argc < 4) {
-            return 0;
-        }
-
-        if ((p = pktbuf_alloc()) == NULL) {
-            printf("out of buffers\n");
-        }
-
-        iter = argv[2].u;
-        p->dlen = argv[3].u;
-        while (iter--) {
-            memset(p->data, iter, 12);
-            gem_send_raw_pkt(NULL, p);
-        }
     } else if (strncmp(argv[1].str, "status", sizeof("status")) == 0) {
         uint32_t mac_top = gem.regs->spec_addr1_top;
         uint32_t mac_bot = gem.regs->spec_addr1_bot;

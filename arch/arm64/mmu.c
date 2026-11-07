@@ -48,13 +48,14 @@ static bool arm64_asids_enabled;
 static asid_allocator_t arm64_asid_allocator;
 
 /*
- * TLB maintenance. Every change follows the same shape: write the descriptor,
- * dsb ishst so the table walkers on every cpu see the write before the
- * invalidate that depends on it, tlbi ...is to broadcast the invalidate, then
- * dsb ish to wait for it to complete everywhere before anything relies on the
- * old translation being gone (freeing a table, reusing an asid, returning to
+ * TLB maintenance. Every change follows the same shape: write the descriptors,
+ * dsb ishst so the table walkers on every cpu see the writes before the
+ * invalidates that depend on them, tlbi ...is to broadcast each invalidate, then
+ * dsb ish to wait for them to complete everywhere before anything relies on the
+ * old translations being gone (freeing a table, reusing an asid, returning to
  * the caller). Kernel mappings add an isb so this cpu's own instruction stream
- * and any speculated accesses pick up the change.
+ * and any speculated accesses pick up the change. arm64_tlb_batch below runs
+ * that shape over a whole unmap or protect call.
  */
 static inline void arm64_tlb_sync_table_writes(void) {
     __asm__ volatile("dsb ishst" ::: "memory");
@@ -87,6 +88,94 @@ static void arm64_tlb_invalidate_va(vaddr_t vaddr, uint asid, bool terminal) {
     }
 }
 
+/*
+ * The invalidates one unmap or protect call issues, so the descriptor writes
+ * behind them share a dsb ishst and the tables they empty are handed back only
+ * after every invalidate has completed. Above ARM64_TLB_BATCH_MAX by-address
+ * invalidates the call drops them for one invalidate of the whole asid (the
+ * whole TLB for the kernel) at the end instead, as Linux does: past that point
+ * the broadcasts cost more than the refills they save.
+ */
+#define ARM64_TLB_BATCH_MAX 1024
+
+struct arm64_tlb_batch {
+    uint asid;
+    uint count;                 /* by-address invalidates asked for */
+    bool flush_all;
+    uint npending;
+    vaddr_t pending[32];        /* page aligned, bit 0 set for a last-level invalidate */
+    struct list_node freed_tables;
+};
+
+static void arm64_tlb_batch_init(struct arm64_tlb_batch *b, uint asid) {
+    b->asid = asid;
+    b->count = 0;
+    b->flush_all = false;
+    b->npending = 0;
+    list_initialize(&b->freed_tables);
+}
+
+/* issue the pending invalidates, after the descriptor writes behind them */
+static void arm64_tlb_batch_issue(struct arm64_tlb_batch *b) {
+    if (b->npending == 0) {
+        return;
+    }
+    arm64_tlb_sync_table_writes();
+    for (uint i = 0; i < b->npending; i++) {
+        arm64_tlb_invalidate_va(b->pending[i] & ~1UL, b->asid, b->pending[i] & 1);
+    }
+    b->npending = 0;
+}
+
+/* called after the descriptor for vaddr was rewritten; terminal as for arm64_tlb_invalidate_va */
+static void arm64_tlb_batch_invalidate(struct arm64_tlb_batch *b, vaddr_t vaddr, bool terminal) {
+    if (b->flush_all) {
+        return;
+    }
+    if (b->count++ >= ARM64_TLB_BATCH_MAX) {
+        b->flush_all = true;
+        b->npending = 0;
+        return;
+    }
+    if (b->npending == countof(b->pending)) {
+        arm64_tlb_batch_issue(b);
+    }
+    b->pending[b->npending++] = vaddr | (terminal ? 1 : 0);
+}
+
+/* a page table whose descriptor was just cleared; freed by arm64_tlb_batch_finish() */
+static void arm64_tlb_batch_free_table(struct arm64_tlb_batch *b, paddr_t paddr) {
+    vm_page_t *page = paddr_to_vm_page(paddr);
+    if (!page) {
+        panic("bad page table paddr 0x%lx\n", paddr);
+    }
+    list_add_tail(&b->freed_tables, &page->node);
+}
+
+/* Complete every invalidate on every cpu, then free the emptied tables. Kernel
+ * mappings add an isb so this cpu's own instruction stream and any speculated
+ * accesses pick up the change. */
+static void arm64_tlb_batch_finish(struct arm64_tlb_batch *b) {
+    if (b->flush_all) {
+        arm64_tlb_sync_table_writes();
+        if (b->asid == MMU_ARM64_GLOBAL_ASID) {
+            ARM64_TLBI_NOADDR(vmalle1is);
+        } else {
+            ARM64_TLBI(aside1is, (uint64_t)b->asid << 48);
+        }
+    } else {
+        arm64_tlb_batch_issue(b);
+    }
+    arm64_tlb_sync_invalidates();
+    if (b->asid == MMU_ARM64_GLOBAL_ASID) {
+        ISB;
+    }
+
+    if (!list_is_empty(&b->freed_tables)) {
+        vm_ptable_freed(pmm_free(&b->freed_tables));
+    }
+}
+
 /* convert user level mmu flags to flags that go in L1 descriptors */
 static status_t mmu_flags_to_pte_attr(uint flags, pte_t *out) {
     pte_t attr = MMU_PTE_ATTR_AF;
@@ -107,22 +196,22 @@ static status_t mmu_flags_to_pte_attr(uint flags, pte_t *out) {
             return ERR_INVALID_ARGS;
     }
 
-    switch (flags & (ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_RO)) {
+    switch (flags & (ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_WRITE)) {
         case 0:
-            attr |= MMU_PTE_ATTR_AP_P_RW_U_NA;
-            break;
-        case ARCH_MMU_FLAG_PERM_RO:
             attr |= MMU_PTE_ATTR_AP_P_RO_U_NA;
             break;
-        case ARCH_MMU_FLAG_PERM_USER:
-            attr |= MMU_PTE_ATTR_AP_P_RW_U_RW;
+        case ARCH_MMU_FLAG_PERM_WRITE:
+            attr |= MMU_PTE_ATTR_AP_P_RW_U_NA;
             break;
-        case ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_RO:
+        case ARCH_MMU_FLAG_PERM_USER:
             attr |= MMU_PTE_ATTR_AP_P_RO_U_RO;
+            break;
+        case ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_WRITE:
+            attr |= MMU_PTE_ATTR_AP_P_RW_U_RW;
             break;
     }
 
-    if (flags & ARCH_MMU_FLAG_PERM_NO_EXECUTE) {
+    if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
         attr |= MMU_PTE_ATTR_UXN | MMU_PTE_ATTR_PXN;
     } else {
         // execute permissions, so set user or privileged XN based on which mode
@@ -141,16 +230,67 @@ static status_t mmu_flags_to_pte_attr(uint flags, pte_t *out) {
     return NO_ERROR;
 }
 
-status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, uint *flags) {
-    uint index;
-    uint index_shift;
+/* How an aspace's tables are laid out: the address the top table's first entry
+ * maps, the shifts, the top table and the asid its entries are tagged with. */
+struct arm64_aspace_layout {
+    vaddr_t base;
+    uint size_shift;
+    uint top_index_shift;
     uint page_size_shift;
-    pte_t pte;
-    pte_t pte_addr;
-    uint descriptor_type;
-    pte_t *page_table;
-    vaddr_t vaddr_rem;
+    pte_t *top;
+    uint asid;
+};
 
+static struct arm64_aspace_layout arm64_layout(const arch_aspace_t *aspace) {
+    if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
+        return (struct arm64_aspace_layout){
+            .base = ~0UL << MMU_KERNEL_SIZE_SHIFT,
+            .size_shift = MMU_KERNEL_SIZE_SHIFT,
+            .top_index_shift = MMU_KERNEL_TOP_SHIFT,
+            .page_size_shift = MMU_KERNEL_PAGE_SIZE_SHIFT,
+            .top = aspace->tt_virt,
+            .asid = MMU_ARM64_GLOBAL_ASID,
+        };
+    }
+    return (struct arm64_aspace_layout){
+        .base = 0,
+        .size_shift = MMU_USER_SIZE_SHIFT,
+        .top_index_shift = MMU_USER_TOP_SHIFT,
+        .page_size_shift = MMU_USER_PAGE_SIZE_SHIFT,
+        .top = aspace->tt_virt,
+        .asid = aspace->asid,
+    };
+}
+
+/* The descriptor that ends the walk for vaddr, which must lie in the aspace: a
+ * page, a block, or an empty entry, with *shift the log2 of the span it covers.
+ * Blocks can sit at the top level: with a 64K granule a kernel top level entry
+ * is a 512MB block. */
+static pte_t arm64_mmu_leaf_at(const arch_aspace_t *aspace, vaddr_t vaddr, uint *shift) {
+    const struct arm64_aspace_layout l = arm64_layout(aspace);
+    const pte_t *page_table = l.top;
+    uint index_shift = l.top_index_shift;
+    vaddr_t vaddr_rem = vaddr - l.base;
+
+    for (;;) {
+        const vaddr_t index = vaddr_rem >> index_shift;
+        vaddr_rem -= index << index_shift;
+        const pte_t pte = page_table[index];
+
+        LTRACEF_LEVEL(2, "va 0x%lx, index %lu, index_shift %u, pte 0x%llx\n", vaddr, index, index_shift, pte);
+
+        if (index_shift > l.page_size_shift &&
+            (pte & MMU_PTE_DESCRIPTOR_MASK) == MMU_PTE_L012_DESCRIPTOR_TABLE) {
+            page_table = paddr_to_kvaddr(pte & MMU_PTE_OUTPUT_ADDR_MASK);
+            index_shift -= l.page_size_shift - 3;
+            continue;
+        }
+        *shift = index_shift;
+        return pte;
+    }
+}
+
+status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, uint *flags) {
     LTRACEF("aspace %p, vaddr 0x%lx\n", aspace, vaddr);
 
     DEBUG_ASSERT(aspace);
@@ -160,59 +300,23 @@ status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, ui
         return ERR_OUT_OF_RANGE;
     }
 
-    /* compute shift values based on if this address space is for kernel or user space */
-    if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
-        index_shift = MMU_KERNEL_TOP_SHIFT;
-        page_size_shift = MMU_KERNEL_PAGE_SIZE_SHIFT;
-
-        vaddr_t kernel_base = ~0UL << MMU_KERNEL_SIZE_SHIFT;
-        vaddr_rem = vaddr - kernel_base;
-
-        index = vaddr_rem >> index_shift;
-        ASSERT(index < MMU_KERNEL_PAGE_TABLE_ENTRIES_TOP);
-    } else {
-        index_shift = MMU_USER_TOP_SHIFT;
-        page_size_shift = MMU_USER_PAGE_SIZE_SHIFT;
-
-        vaddr_rem = vaddr;
-        index = vaddr_rem >> index_shift;
-        ASSERT(index < MMU_USER_PAGE_TABLE_ENTRIES_TOP);
+    uint shift;
+    const pte_t pte = arm64_mmu_leaf_at(aspace, vaddr, &shift);
+    const uint descriptor_type = pte & MMU_PTE_DESCRIPTOR_MASK;
+    if (descriptor_type == MMU_PTE_DESCRIPTOR_INVALID) {
+        return ERR_NOT_FOUND;
     }
-
-    page_table = aspace->tt_virt;
-
-    while (true) {
-        index = vaddr_rem >> index_shift;
-        vaddr_rem -= (vaddr_t)index << index_shift;
-        pte = page_table[index];
-        descriptor_type = pte & MMU_PTE_DESCRIPTOR_MASK;
-        pte_addr = pte & MMU_PTE_OUTPUT_ADDR_MASK;
-
-        LTRACEF("va 0x%lx, index %d, index_shift %d, rem 0x%lx, pte 0x%llx\n",
-                vaddr, index, index_shift, vaddr_rem, pte);
-
-        if (descriptor_type == MMU_PTE_DESCRIPTOR_INVALID) {
-            return ERR_NOT_FOUND;
-        }
-
-        if (descriptor_type == ((index_shift > page_size_shift) ? MMU_PTE_L012_DESCRIPTOR_BLOCK : MMU_PTE_L3_DESCRIPTOR_PAGE)) {
-            break;
-        }
-
-        if (index_shift <= page_size_shift ||
-            descriptor_type != MMU_PTE_L012_DESCRIPTOR_TABLE) {
-            PANIC_UNIMPLEMENTED;
-        }
-
-        page_table = paddr_to_kvaddr(pte_addr);
-        index_shift -= page_size_shift - 3;
+    const uint page_size_shift = (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) ?
+                                 MMU_KERNEL_PAGE_SIZE_SHIFT : MMU_USER_PAGE_SIZE_SHIFT;
+    if (descriptor_type != ((shift > page_size_shift) ? MMU_PTE_L012_DESCRIPTOR_BLOCK : MMU_PTE_L3_DESCRIPTOR_PAGE)) {
+        PANIC_UNIMPLEMENTED;
     }
 
     if (paddr) {
-        *paddr = pte_addr + vaddr_rem;
+        *paddr = (pte & MMU_PTE_OUTPUT_ADDR_MASK) + (vaddr & ((1UL << shift) - 1));
     }
     if (flags) {
-        *flags = 0;
+        *flags = ARCH_MMU_FLAG_PERM_READ;
         if (pte & MMU_PTE_ATTR_NON_SECURE) {
             *flags |= ARCH_MMU_FLAG_NS;
         }
@@ -228,41 +332,35 @@ status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, ui
             default:
                 PANIC_UNIMPLEMENTED;
         }
-        switch (pte & MMU_PTE_ATTR_AP_MASK) {
-            case MMU_PTE_ATTR_AP_P_RW_U_NA:
-                break;
-            case MMU_PTE_ATTR_AP_P_RW_U_RW:
-                *flags |= ARCH_MMU_FLAG_PERM_USER;
-                break;
-            case MMU_PTE_ATTR_AP_P_RO_U_NA:
-                *flags |= ARCH_MMU_FLAG_PERM_RO;
-                break;
-            case MMU_PTE_ATTR_AP_P_RO_U_RO:
-                *flags |= ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_RO;
-                break;
+        if (!(pte & MMU_PTE_ATTR_AP_RO)) {
+            *flags |= ARCH_MMU_FLAG_PERM_WRITE;
         }
-
-        // if we have previously detected a user or privileged page, test
-        // the appropriate NX bit to determine no execute
-        if (*flags & ARCH_MMU_FLAG_PERM_USER) {
-            if (pte & MMU_PTE_ATTR_UXN) {
-                *flags |= ARCH_MMU_FLAG_PERM_NO_EXECUTE;
+        /* a user page executes from user mode, a kernel page from the kernel,
+         * so the matching XN bit decides */
+        if (pte & MMU_PTE_ATTR_AP_USER) {
+            *flags |= ARCH_MMU_FLAG_PERM_USER;
+            if (!(pte & MMU_PTE_ATTR_UXN)) {
+                *flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
             }
         } else {
-            if (pte & MMU_PTE_ATTR_PXN) {
-                *flags |= ARCH_MMU_FLAG_PERM_NO_EXECUTE;
+            if (!(pte & MMU_PTE_ATTR_PXN)) {
+                *flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
             }
         }
     }
     LTRACEF("va 0x%lx, paddr 0x%lx, flags 0x%x\n",
             vaddr, paddr ? *paddr : ~0UL, flags ? *flags : ~0U);
-    return 0;
+    return NO_ERROR;
 }
 
 static int alloc_page_table(paddr_t *paddrp, uint page_size_shift) {
     size_t size = 1U << page_size_shift;
 
     LTRACEF("page_size_shift %u\n", page_size_shift);
+
+    if (!vm_ptable_budget_take()) {
+        return ERR_NO_MEMORY;
+    }
 
     if (size == PAGE_SIZE) {
         vm_page_t *p = pmm_alloc_page();
@@ -292,38 +390,22 @@ static int alloc_page_table(paddr_t *paddrp, uint page_size_shift) {
     return 0;
 }
 
-static void free_page_table(void *vaddr, paddr_t paddr, uint page_size_shift) {
-    LTRACEF("vaddr %p paddr 0x%lx page_size_shift %u\n", vaddr, paddr, page_size_shift);
-
-    size_t size = 1U << page_size_shift;
-    vm_page_t *page;
-
-    if (size >= PAGE_SIZE) {
-        page = paddr_to_vm_page(paddr);
-        if (!page) {
-            panic("bad page table paddr 0x%lx\n", paddr);
-        }
-        pmm_free_page(page);
-    } else {
-        free(vaddr);
-    }
-}
-
-static pte_t *arm64_mmu_get_page_table(vaddr_t index, uint page_size_shift, pte_t *page_table) {
-    pte_t pte;
+/* The table the entry at index points to, allocating and linking an empty one
+ * if the entry is empty. ERR_NO_MEMORY if that fails, ERR_ALREADY_EXISTS if a
+ * block is there. */
+static status_t arm64_mmu_get_page_table(vaddr_t index, uint page_size_shift, pte_t *page_table,
+                                         pte_t **next) {
+    pte_t pte = page_table[index];
     paddr_t paddr;
-    void *vaddr;
-    int ret;
 
-    pte = page_table[index];
     switch (pte & MMU_PTE_DESCRIPTOR_MASK) {
-        case MMU_PTE_DESCRIPTOR_INVALID:
-            ret = alloc_page_table(&paddr, page_size_shift);
-            if (ret) {
-                TRACEF("failed to allocate page table\n");
-                return NULL;
+        case MMU_PTE_DESCRIPTOR_INVALID: {
+            status_t err = alloc_page_table(&paddr, page_size_shift);
+            if (err != NO_ERROR) {
+                LTRACEF("failed to allocate page table\n");
+                return err;
             }
-            vaddr = paddr_to_kvaddr(paddr);
+            void *vaddr = paddr_to_kvaddr(paddr);
 
             LTRACEF("allocated page table, vaddr %p, paddr 0x%lx\n", vaddr, paddr);
             memset(vaddr, MMU_PTE_DESCRIPTOR_INVALID, 1U << page_size_shift);
@@ -335,15 +417,17 @@ static pte_t *arm64_mmu_get_page_table(vaddr_t index, uint page_size_shift, pte_
             pte = paddr | MMU_PTE_L012_DESCRIPTOR_TABLE;
             page_table[index] = pte;
             LTRACEF("pte %p[0x%lx] = 0x%llx\n", page_table, index, pte);
-            return vaddr;
-
+            *next = vaddr;
+            return NO_ERROR;
+        }
         case MMU_PTE_L012_DESCRIPTOR_TABLE:
             paddr = pte & MMU_PTE_OUTPUT_ADDR_MASK;
             LTRACEF("found page table 0x%lx\n", paddr);
-            return paddr_to_kvaddr(paddr);
+            *next = paddr_to_kvaddr(paddr);
+            return NO_ERROR;
 
         case MMU_PTE_L012_DESCRIPTOR_BLOCK:
-            return NULL;
+            return ERR_ALREADY_EXISTS;
 
         default:
             PANIC_UNIMPLEMENTED;
@@ -365,15 +449,13 @@ static bool page_table_is_clear(pte_t *page_table, uint page_size_shift) {
     return true;
 }
 
-/* Unmap [vaddr, vaddr + size) below page_table, invalidating each entry as it
- * goes and freeing tables that end up empty. Returns ERR_NOT_SUPPORTED on a block
- * descriptor that covers more than the range, since splitting one needs a
- * break-before-make with a new table; whatever preceded it in the range is
- * already unmapped by then. */
+/* Unmap [vaddr, vaddr + size) below page_table, queueing an invalidate for each
+ * entry and handing tables that end up empty to the batch. The caller has made
+ * sure the range cuts no block; one that does is refused with ERR_NOT_SUPPORTED. */
 static status_t arm64_mmu_unmap_pt(vaddr_t vaddr, vaddr_t vaddr_rel,
                                    size_t size,
                                    uint index_shift, uint page_size_shift,
-                                   pte_t *page_table, uint asid) {
+                                   pte_t *page_table, struct arm64_tlb_batch *batch) {
     pte_t *next_page_table;
     vaddr_t index;
     size_t chunk_size;
@@ -402,7 +484,7 @@ static status_t arm64_mmu_unmap_pt(vaddr_t vaddr, vaddr_t vaddr_rel,
             status_t err = arm64_mmu_unmap_pt(vaddr, vaddr_rem, chunk_size,
                                               index_shift - (page_size_shift - 3),
                                               page_size_shift,
-                                              next_page_table, asid);
+                                              next_page_table, batch);
             if (err < 0) {
                 return err;
             }
@@ -412,26 +494,22 @@ static status_t arm64_mmu_unmap_pt(vaddr_t vaddr, vaddr_t vaddr_rel,
                 page_table[index] = MMU_PTE_DESCRIPTOR_INVALID;
 
                 /* The walkers may hold this descriptor in their walk caches, and
-                 * a walk through the table may be in flight: invalidate the
-                 * intermediate entry and wait for that to complete on every cpu
-                 * before the page can be handed out again. */
-                arm64_tlb_sync_table_writes();
-                arm64_tlb_invalidate_va(vaddr, asid, false);
-                arm64_tlb_sync_invalidates();
-
-                free_page_table(next_page_table, page_table_paddr, page_size_shift);
+                 * a walk through the table may be in flight: the intermediate
+                 * entry is invalidated too, and the page is handed out again
+                 * only once that has completed on every cpu. */
+                arm64_tlb_batch_invalidate(batch, vaddr, false);
+                arm64_tlb_batch_free_table(batch, page_table_paddr);
             }
         } else if (pte) {
             if (index_shift > page_size_shift && chunk_size != block_size) {
-                TRACEF("partial unmap of block descriptor at %p[0x%lx] (0x%llx) not supported\n",
-                       page_table, index, pte);
+                DEBUG_ASSERT_MSG(false, "partial unmap of block descriptor at %p[0x%lx] (0x%llx)\n",
+                                 page_table, index, pte);
                 return ERR_NOT_SUPPORTED;
             }
 
             LTRACEF("pte %p[0x%lx] = 0\n", page_table, index);
             page_table[index] = MMU_PTE_DESCRIPTOR_INVALID;
-            arm64_tlb_sync_table_writes();
-            arm64_tlb_invalidate_va(vaddr, asid, true);
+            arm64_tlb_batch_invalidate(batch, vaddr, true);
         } else {
             LTRACEF("pte %p[0x%lx] already clear\n", page_table, index);
         }
@@ -443,72 +521,59 @@ static status_t arm64_mmu_unmap_pt(vaddr_t vaddr, vaddr_t vaddr_rel,
     return NO_ERROR;
 }
 
-static int arm64_mmu_map_pt(vaddr_t vaddr_in, vaddr_t vaddr_rel_in,
-                            paddr_t paddr_in,
-                            size_t size_in, pte_t attrs,
-                            uint index_shift, uint page_size_shift,
-                            pte_t *page_table, uint asid) {
-    int ret;
-    pte_t *next_page_table;
-    vaddr_t index;
-    vaddr_t vaddr = vaddr_in;
-    vaddr_t vaddr_rel = vaddr_rel_in;
-    paddr_t paddr = paddr_in;
-    size_t size = size_in;
-    size_t chunk_size;
-    vaddr_t vaddr_rem;
-    vaddr_t block_size;
-    vaddr_t block_mask;
-    pte_t pte;
-
+/* Map [vaddr, vaddr + size) below page_table. An existing table is descended
+ * into; a page or block in the way stops the walk with ERR_ALREADY_EXISTS, and
+ * a table that cannot be allocated with ERR_NO_MEMORY, *fail_vaddr the address
+ * it stopped at. Everything before that is mapped, nothing after it, and the
+ * caller takes back what went in. */
+static status_t arm64_mmu_map_pt(vaddr_t vaddr, vaddr_t vaddr_rel,
+                                 paddr_t paddr,
+                                 size_t size, pte_t attrs,
+                                 uint index_shift, uint page_size_shift,
+                                 pte_t *page_table, vaddr_t *fail_vaddr) {
     LTRACEF("vaddr 0x%lx, vaddr_rel 0x%lx, paddr 0x%lx, size 0x%lx, attrs 0x%llx, index shift %d, page_size_shift %d, page_table %p\n",
             vaddr, vaddr_rel, paddr, size, attrs,
             index_shift, page_size_shift, page_table);
 
-    if ((vaddr_rel | paddr | size) & ((1UL << page_size_shift) - 1)) {
-        TRACEF("not page aligned\n");
-        return ERR_INVALID_ARGS;
-    }
+    DEBUG_ASSERT(((vaddr_rel | paddr | size) & ((1UL << page_size_shift) - 1)) == 0);
 
     while (size) {
-        block_size = 1UL << index_shift;
-        block_mask = block_size - 1;
-        vaddr_rem = vaddr_rel & block_mask;
-        chunk_size = MIN(size, block_size - vaddr_rem);
-        index = vaddr_rel >> index_shift;
+        const vaddr_t block_size = 1UL << index_shift;
+        const vaddr_t block_mask = block_size - 1;
+        const vaddr_t vaddr_rem = vaddr_rel & block_mask;
+        const size_t chunk_size = MIN(size, block_size - vaddr_rem);
+        const vaddr_t index = vaddr_rel >> index_shift;
+        const pte_t pte = page_table[index];
 
-        if (((vaddr_rel | paddr) & block_mask) ||
-            (chunk_size != block_size) ||
-            (index_shift > MMU_PTE_DESCRIPTOR_BLOCK_MAX_SHIFT)) {
-            next_page_table = arm64_mmu_get_page_table(index, page_size_shift,
-                                                       page_table);
-            if (!next_page_table) {
-                goto err;
+        const bool page_level = index_shift == page_size_shift;
+        const bool table_there = !page_level &&
+                                 (pte & MMU_PTE_DESCRIPTOR_MASK) == MMU_PTE_L012_DESCRIPTOR_TABLE;
+        const bool fits_block = ((vaddr_rel | paddr) & block_mask) == 0 && chunk_size == block_size &&
+                                index_shift <= MMU_PTE_DESCRIPTOR_BLOCK_MAX_SHIFT;
+
+        if (table_there || (!page_level && !fits_block && pte == MMU_PTE_DESCRIPTOR_INVALID)) {
+            /* go down into the table there, or a fresh one */
+            pte_t *next_page_table;
+            status_t err = arm64_mmu_get_page_table(index, page_size_shift, page_table, &next_page_table);
+            if (err != NO_ERROR) {
+                *fail_vaddr = vaddr;
+                return err;
             }
-
-            ret = arm64_mmu_map_pt(vaddr, vaddr_rem, paddr, chunk_size, attrs,
+            err = arm64_mmu_map_pt(vaddr, vaddr_rem, paddr, chunk_size, attrs,
                                    index_shift - (page_size_shift - 3),
-                                   page_size_shift, next_page_table, asid);
-            if (ret) {
-                goto err;
+                                   page_size_shift, next_page_table, fail_vaddr);
+            if (err != NO_ERROR) {
+                return err;
             }
+        } else if (pte != MMU_PTE_DESCRIPTOR_INVALID) {
+            LTRACEF("page table entry already in use, index 0x%lx, 0x%llx\n", index, pte);
+            *fail_vaddr = vaddr;
+            return ERR_ALREADY_EXISTS;
         } else {
-            pte = page_table[index];
-            if (pte) {
-                TRACEF("page table entry already in use, index 0x%lx, 0x%llx\n",
-                       index, pte);
-                goto err;
-            }
-
-            pte = paddr | attrs;
-            if (index_shift > page_size_shift) {
-                pte |= MMU_PTE_L012_DESCRIPTOR_BLOCK;
-            } else {
-                pte |= MMU_PTE_L3_DESCRIPTOR_PAGE;
-            }
-
-            LTRACEF("pte %p[0x%lx] = 0x%llx\n", page_table, index, pte);
-            page_table[index] = pte;
+            const pte_t new_pte = paddr | attrs |
+                                  (page_level ? MMU_PTE_L3_DESCRIPTOR_PAGE : MMU_PTE_L012_DESCRIPTOR_BLOCK);
+            LTRACEF("pte %p[0x%lx] = 0x%llx\n", page_table, index, new_pte);
+            page_table[index] = new_pte;
         }
         vaddr += chunk_size;
         vaddr_rel += chunk_size;
@@ -516,97 +581,130 @@ static int arm64_mmu_map_pt(vaddr_t vaddr_in, vaddr_t vaddr_rel_in,
         size -= chunk_size;
     }
 
-    return 0;
-
-err:
-    arm64_mmu_unmap_pt(vaddr_in, vaddr_rel_in, size_in - size,
-                       index_shift, page_size_shift, page_table, asid);
-    arm64_tlb_sync_invalidates();
-    return ERR_GENERIC;
+    return NO_ERROR;
 }
 
-int arm64_mmu_map(vaddr_t vaddr, paddr_t paddr, size_t size, pte_t attrs,
-                  vaddr_t vaddr_base, uint top_size_shift,
-                  uint top_index_shift, uint page_size_shift,
-                  pte_t *top_page_table, uint asid) {
-    int ret;
-    vaddr_t vaddr_rel = vaddr - vaddr_base;
-    vaddr_t vaddr_rel_max = 1UL << top_size_shift;
-
-    LTRACEF("vaddr 0x%lx, paddr 0x%lx, size 0x%lx, attrs 0x%llx, asid 0x%x\n",
-            vaddr, paddr, size, attrs, asid);
-
-    if (vaddr_rel > vaddr_rel_max - size || size > vaddr_rel_max) {
-        TRACEF("vaddr 0x%lx, size 0x%lx out of range vaddr 0x%lx, size 0x%lx\n",
-               vaddr, size, vaddr_base, vaddr_rel_max);
-        return ERR_OUT_OF_RANGE;
+/* the entry with its permissions replaced from flags: AP[2] makes it read only
+ * without WRITE, and it executes only in its own mode, user (AP[1]) or kernel,
+ * and only with EXECUTE */
+static pte_t arm64_pte_with_perms(pte_t pte, uint flags) {
+    pte &= ~(MMU_PTE_ATTR_AP_RO | MMU_PTE_ATTR_UXN | MMU_PTE_ATTR_PXN);
+    if (!(flags & ARCH_MMU_FLAG_PERM_WRITE)) {
+        pte |= MMU_PTE_ATTR_AP_RO;
     }
-
-    if (!top_page_table) {
-        TRACEF("page table is NULL\n");
-        return ERR_INVALID_ARGS;
+    if (pte & MMU_PTE_ATTR_AP_USER) {
+        pte |= MMU_PTE_ATTR_PXN;
+        if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
+            pte |= MMU_PTE_ATTR_UXN;
+        }
+    } else {
+        pte |= MMU_PTE_ATTR_UXN;
+        if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
+            pte |= MMU_PTE_ATTR_PXN;
+        }
     }
-
-    ret = arm64_mmu_map_pt(vaddr, vaddr_rel, paddr, size, attrs,
-                           top_index_shift, page_size_shift, top_page_table, asid);
-
-    /* The new descriptors must reach the walkers before the caller touches the
-     * mapping. A kernel mapping may be used right away by this cpu, so also keep
-     * it from running ahead on a translation speculated before the write; user
-     * mappings get that from the exception return into user space. */
-    arm64_tlb_sync_table_writes();
-    if (asid == MMU_ARM64_GLOBAL_ASID) {
-        ISB;
-    }
-    return ret;
+    return pte;
 }
 
-int arm64_mmu_unmap(vaddr_t vaddr, size_t size,
-                    vaddr_t vaddr_base, uint top_size_shift,
-                    uint top_index_shift, uint page_size_shift,
-                    pte_t *top_page_table, uint asid) {
-    vaddr_t vaddr_rel = vaddr - vaddr_base;
-    vaddr_t vaddr_rel_max = 1UL << top_size_shift;
+/* Give every page and block in [vaddr, vaddr + size) below page_table the
+ * permissions in flags, queueing an invalidate for each entry that changes. A
+ * permission change needs no break-before-make. The caller has made sure the range cuts
+ * no block. With check_only nothing is written, and the walk only reports
+ * ERR_INVALID_ARGS if flags asks for EXECUTE on a page that is not normal
+ * memory. */
+static status_t arm64_mmu_protect_pt(vaddr_t vaddr, vaddr_t vaddr_rel, size_t size,
+                                     uint index_shift, uint page_size_shift,
+                                     pte_t *page_table, uint flags, struct arm64_tlb_batch *batch,
+                                     bool check_only) {
+    while (size) {
+        const vaddr_t block_size = 1UL << index_shift;
+        const vaddr_t vaddr_rem = vaddr_rel & (block_size - 1);
+        const size_t chunk_size = MIN(size, block_size - vaddr_rem);
+        const vaddr_t index = vaddr_rel >> index_shift;
+        const pte_t pte = page_table[index];
 
-    LTRACEF("vaddr 0x%lx, size 0x%lx, asid 0x%x\n", vaddr, size, asid);
-
-    if (vaddr_rel > vaddr_rel_max - size || size > vaddr_rel_max) {
-        TRACEF("vaddr 0x%lx, size 0x%lx out of range vaddr 0x%lx, size 0x%lx\n",
-               vaddr, size, vaddr_base, vaddr_rel_max);
-        return ERR_OUT_OF_RANGE;
+        if (index_shift > page_size_shift &&
+            (pte & MMU_PTE_DESCRIPTOR_MASK) == MMU_PTE_L012_DESCRIPTOR_TABLE) {
+            status_t err = arm64_mmu_protect_pt(vaddr, vaddr_rem, chunk_size,
+                                                index_shift - (page_size_shift - 3), page_size_shift,
+                                                paddr_to_kvaddr(pte & MMU_PTE_OUTPUT_ADDR_MASK),
+                                                flags, batch, check_only);
+            if (err != NO_ERROR) {
+                return err;
+            }
+        } else if (pte) {
+            DEBUG_ASSERT(index_shift == page_size_shift || chunk_size == block_size);
+            if (check_only) {
+                if ((flags & ARCH_MMU_FLAG_PERM_EXECUTE) &&
+                    (pte & MMU_PTE_ATTR_ATTR_INDEX_MASK) != MMU_PTE_ATTR_NORMAL_MEMORY) {
+                    LTRACEF("execute asked for on uncached memory at 0x%lx\n", vaddr);
+                    return ERR_INVALID_ARGS;
+                }
+            } else {
+                const pte_t new_pte = arm64_pte_with_perms(pte, flags);
+                if (new_pte != pte) {
+                    LTRACEF("pte %p[0x%lx] = 0x%llx (was 0x%llx)\n", page_table, index, new_pte, pte);
+                    page_table[index] = new_pte;
+                    arm64_tlb_batch_invalidate(batch, vaddr, true);
+                }
+            }
+        }
+        vaddr += chunk_size;
+        vaddr_rel += chunk_size;
+        size -= chunk_size;
     }
 
-    if (!top_page_table) {
-        TRACEF("page table is NULL\n");
-        return ERR_INVALID_ARGS;
-    }
+    return NO_ERROR;
+}
 
-    status_t err = arm64_mmu_unmap_pt(vaddr, vaddr_rel, size,
-                                      top_index_shift, page_size_shift, top_page_table, asid);
+/* unmap [vaddr, vaddr + size), then wait for every invalidate to complete on every cpu */
+static status_t arm64_mmu_unmap(const struct arm64_aspace_layout *l, vaddr_t vaddr, size_t size) {
+    LTRACEF("vaddr 0x%lx, size 0x%lx, asid 0x%x\n", vaddr, size, l->asid);
 
-    /* wait for every invalidate above to complete on every cpu */
-    arm64_tlb_sync_invalidates();
-    if (asid == MMU_ARM64_GLOBAL_ASID) {
-        ISB;
-    }
+    struct arm64_tlb_batch batch;
+    arm64_tlb_batch_init(&batch, l->asid);
+    status_t err = arm64_mmu_unmap_pt(vaddr, vaddr - l->base, size,
+                                      l->top_index_shift, l->page_size_shift, l->top, &batch);
+    arm64_tlb_batch_finish(&batch);
     return err;
 }
 
-int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, uint flags) {
+/* Whether unmap or protect may change [vaddr, vaddr + count pages) without
+ * splitting a block, decided before either touches anything. Only the two ends
+ * of the range can cut one. */
+static status_t arm64_mmu_check_range_ends(const arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
+    const vaddr_t last = vaddr + ((vaddr_t)count - 1) * PAGE_SIZE;
+    const vaddr_t ends[] = { vaddr, last };
+    for (uint i = 0; i < countof(ends); i++) {
+        uint shift;
+        const pte_t pte = arm64_mmu_leaf_at(aspace, ends[i], &shift);
+        if ((pte & MMU_PTE_DESCRIPTOR_MASK) != MMU_PTE_L012_DESCRIPTOR_BLOCK) {
+            continue;
+        }
+        const vaddr_t block = ROUNDDOWN(ends[i], 1UL << shift);
+        const vaddr_t block_last = block + ((1UL << shift) - 1);
+        if (block < vaddr || block_last > last + (PAGE_SIZE - 1)) {
+            LTRACEF("range at 0x%lx covers part of a block at 0x%lx\n", vaddr, block);
+            return ERR_NOT_SUPPORTED;
+        }
+    }
+    return NO_ERROR;
+}
+
+status_t arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, uint flags) {
     LTRACEF("vaddr 0x%lx paddr 0x%lx count %u flags 0x%x\n", vaddr, paddr, count, flags);
 
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
-        return ERR_OUT_OF_RANGE;
+    /* the output address is bits [47:12] of a descriptor */
+    if (!IS_PAGE_ALIGNED(vaddr) || !IS_PAGE_ALIGNED(paddr) ||
+        !arch_mmu_paddr_range_valid(paddr, count, 48) || !arch_mmu_flags_valid(flags)) {
+        return ERR_INVALID_ARGS;
     }
 
-    /* paddr and vaddr must be aligned */
-    DEBUG_ASSERT(IS_PAGE_ALIGNED(vaddr));
-    DEBUG_ASSERT(IS_PAGE_ALIGNED(paddr));
-    if (!IS_PAGE_ALIGNED(vaddr) || !IS_PAGE_ALIGNED(paddr)) {
-        return ERR_INVALID_ARGS;
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
     }
 
     if (count == 0) {
@@ -619,55 +717,109 @@ int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count
         return err;
     }
 
-    int ret;
-    if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
-        ret = arm64_mmu_map(vaddr, paddr, count * PAGE_SIZE, attrs,
-                            ~0UL << MMU_KERNEL_SIZE_SHIFT, MMU_KERNEL_SIZE_SHIFT,
-                            MMU_KERNEL_TOP_SHIFT, MMU_KERNEL_PAGE_SIZE_SHIFT,
-                            aspace->tt_virt, MMU_ARM64_GLOBAL_ASID);
-    } else {
-        /* user entries are tagged with the aspace's asid rather than shared by all */
+    /* user entries are tagged with the aspace's asid rather than shared by all */
+    const struct arm64_aspace_layout l = arm64_layout(aspace);
+    if (!(aspace->flags & ARCH_ASPACE_FLAG_KERNEL)) {
         attrs |= MMU_PTE_ATTR_NON_GLOBAL;
-        ret = arm64_mmu_map(vaddr, paddr, count * PAGE_SIZE, attrs,
-                            0, MMU_USER_SIZE_SHIFT,
-                            MMU_USER_TOP_SHIFT, MMU_USER_PAGE_SIZE_SHIFT,
-                            aspace->tt_virt, aspace->asid);
     }
 
-    return ret;
+    vaddr_t fail_vaddr = vaddr;
+    err = arm64_mmu_map_pt(vaddr, vaddr - l.base, paddr, count * PAGE_SIZE, attrs,
+                           l.top_index_shift, l.page_size_shift, l.top, &fail_vaddr);
+    if (err != NO_ERROR) {
+        /* Take back what went in: the pages before a collision, or through the
+         * page a table was missing for, so the empty tables linked for it are
+         * reclaimed as well. */
+        const size_t done = (fail_vaddr - vaddr) + (err == ERR_NO_MEMORY ? PAGE_SIZE : 0);
+        if (done > 0) {
+            __UNUSED status_t unmap_err = arm64_mmu_unmap(&l, vaddr, done);
+            DEBUG_ASSERT(unmap_err == NO_ERROR);
+        }
+        return err;
+    }
+
+    /* The new descriptors must reach the walkers before the caller touches the
+     * mapping. A kernel mapping may be used right away by this cpu, so also keep
+     * it from running ahead on a translation speculated before the write; user
+     * mappings get that from the exception return into user space. */
+    arm64_tlb_sync_table_writes();
+    if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
+        ISB;
+    }
+    return NO_ERROR;
 }
 
-int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
+status_t arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
     LTRACEF("vaddr 0x%lx count %u\n", vaddr, count);
 
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
-        return ERR_OUT_OF_RANGE;
-    }
-
-    DEBUG_ASSERT(IS_PAGE_ALIGNED(vaddr));
     if (!IS_PAGE_ALIGNED(vaddr)) {
         return ERR_INVALID_ARGS;
     }
 
-    int ret;
-    if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
-        ret = arm64_mmu_unmap(vaddr, count * PAGE_SIZE,
-                              ~0UL << MMU_KERNEL_SIZE_SHIFT, MMU_KERNEL_SIZE_SHIFT,
-                              MMU_KERNEL_TOP_SHIFT, MMU_KERNEL_PAGE_SIZE_SHIFT,
-                              aspace->tt_virt,
-                              MMU_ARM64_GLOBAL_ASID);
-    } else {
-        ret = arm64_mmu_unmap(vaddr, count * PAGE_SIZE,
-                              0, MMU_USER_SIZE_SHIFT,
-                              MMU_USER_TOP_SHIFT, MMU_USER_PAGE_SIZE_SHIFT,
-                              aspace->tt_virt,
-                              aspace->asid);
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
     }
 
-    return ret;
+    if (count == 0) {
+        return NO_ERROR;
+    }
+
+    status_t err = arm64_mmu_check_range_ends(aspace, vaddr, count);
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    const struct arm64_aspace_layout l = arm64_layout(aspace);
+    return arm64_mmu_unmap(&l, vaddr, count * PAGE_SIZE);
+}
+
+status_t arch_mmu_protect(arch_aspace_t *aspace, vaddr_t vaddr, uint count, uint flags) {
+    LTRACEF("vaddr 0x%lx count %u flags 0x%x\n", vaddr, count, flags);
+
+    DEBUG_ASSERT(aspace);
+    DEBUG_ASSERT(aspace->tt_virt);
+
+    if (!IS_PAGE_ALIGNED(vaddr) || !arch_mmu_protect_flags_valid(flags)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
+    if (count == 0) {
+        return NO_ERROR;
+    }
+
+    status_t err = arm64_mmu_check_range_ends(aspace, vaddr, count);
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    const struct arm64_aspace_layout l = arm64_layout(aspace);
+    const size_t size = count * PAGE_SIZE;
+
+    struct arm64_tlb_batch batch;
+    arm64_tlb_batch_init(&batch, l.asid);
+
+    /* EXECUTE on device memory is refused before any entry changes */
+    if (flags & ARCH_MMU_FLAG_PERM_EXECUTE) {
+        err = arm64_mmu_protect_pt(vaddr, vaddr - l.base, size, l.top_index_shift, l.page_size_shift,
+                                   l.top, flags, &batch, true);
+        if (err != NO_ERROR) {
+            return err;
+        }
+    }
+
+    err = arm64_mmu_protect_pt(vaddr, vaddr - l.base, size, l.top_index_shift, l.page_size_shift,
+                               l.top, flags, &batch, false);
+    DEBUG_ASSERT(err == NO_ERROR);
+
+    arm64_tlb_batch_finish(&batch);
+    return err;
 }
 
 status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, uint flags) {
@@ -752,7 +904,6 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     /* Drop whatever the TLBs still hold under this asid on every cpu, walk cache
      * entries included, and wait for that to finish before the asid or the root
      * table can be reused. */
-    arm64_tlb_sync_table_writes();
     ARM64_TLBI(aside1is, (uint64_t)aspace->asid << 48);
     arm64_tlb_sync_invalidates();
 
@@ -788,8 +939,9 @@ void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
 
         const uint64_t ttbr = ((uint64_t)aspace->asid << 48) | aspace->tt_phys;
 
-        /* TTBR0 walks are on exactly when a user aspace is loaded */
-        bool walks_enabled = (old_aspace != NULL);
+        /* read from the cpu rather than inferred from old_aspace, which only
+         * says what the scheduler believes is loaded */
+        bool walks_enabled = (ARM64_READ_SYSREG(tcr_el1) & MMU_TCR_EPD0) == 0;
 
         if (!arm64_asids_enabled && old_aspace != aspace) {
             /* Every user aspace shares the asid, so whatever the TLB holds under

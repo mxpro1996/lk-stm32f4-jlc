@@ -17,12 +17,24 @@ class QEMUTestRunner:
         self.architectures = {
             'arm': {
                 'script': 'do-qemuarm',
-                'args': '',
+                'args': '-s4',
                 'timeout': 90
             },
             'arm64': {
                 'script': 'do-qemuarm',
                 'args': '-6s4',
+                'timeout': 90
+            },
+            # the same kernel with 16K and 64K pages, which changes the shape of
+            # the page tables and the sizes of the large pages
+            'arm64-16k': {
+                'script': 'do-qemuarm',
+                'args': '-6s4 -P 16k',
+                'timeout': 90
+            },
+            'arm64-64k': {
+                'script': 'do-qemuarm',
+                'args': '-6s4 -P 64k',
                 'timeout': 90
             },
             # The cortex-m boards qemu models for ARM's MPS2/MPS3 prototyping
@@ -69,6 +81,19 @@ class QEMUTestRunner:
                 'args': '-6Ss4',
                 'timeout': 90
             },
+            # the same kernel on a cpu without Svvptc, so the fenced map path,
+            # which is what real boards run, stays covered
+            'riscv64-nosvvptc': {
+                'script': 'do-qemuriscv',
+                'args': '-6Ss4 -F svvptc=off',
+                'timeout': 90
+            },
+            # three levels of page table (sv39) rather than the default four
+            'riscv64-sv39': {
+                'script': 'do-qemuriscv',
+                'args': '-6Ss4 -p qemu-virt-riscv64-supervisor-sv39-test',
+                'timeout': 90
+            },
             'x86': {
                 'script': 'do-qemux86',
                 'args': '-s4',
@@ -77,6 +102,13 @@ class QEMUTestRunner:
             'x86-64': {
                 'script': 'do-qemux86',
                 'args': '-6s4',
+                'timeout': 90
+            },
+            # the same kernel on a cpu without x2apic, so the local apic is
+            # reached through its memory mapped registers, as on older cpus
+            'x86-64-xapic': {
+                'script': 'do-qemux86',
+                'args': '-6s4 -F x2apic=off',
                 'timeout': 90
             },
             # same kernels on the i440fx/PIIX machine: no MCFG/ECAM (legacy
@@ -123,12 +155,7 @@ class QEMUTestRunner:
             env['TOOLCHAIN'] = 'clang'
             if toolchain == 'clang-lld':
                 env['LD'] = 'ld.lld'
-            if 'CLANG_BINDIR' not in env:
-                import glob
-                bindirs = glob.glob('/usr/lib/llvm-*/bin')
-                if bindirs and os.path.exists(os.path.join(bindirs[0], 'clang')):
-                    env['CLANG_BINDIR'] = bindirs[0]
-                    env['PATH'] = f"{bindirs[0]}:{env.get('PATH', '')}"
+            # engine.mk picks the LLVM install (CLANG_BINDIR) when it is not set
 
         # Create the QEMU commandline
         qemu_cmdline = [str(script_path)]
@@ -391,10 +418,12 @@ class QEMUTestRunner:
 
 def main():
     parser = argparse.ArgumentParser(description='Run LK QEMU tests for multiple architectures')
-    parser.add_argument('--arch', choices=['arm', 'arm64', 'arm-m3', 'arm-m4', 'arm-m7',
+    parser.add_argument('--arch', choices=['arm', 'arm64', 'arm64-16k', 'arm64-64k',
+                                          'arm-m3', 'arm-m4', 'arm-m7',
                                           'arm-m33', 'arm-m55', 'm68k', 'riscv32', 'riscv64',
+                                          'riscv64-nosvvptc', 'riscv64-sv39',
                                           'x86', 'x86-64', 'x86-i440fx', 'x86-64-i440fx',
-                                          'x86-64-uefi'], action='append',
+                                          'x86-64-uefi', 'x86-64-xapic'], action='append',
                        help='Architecture to test (can be specified multiple times)')
     parser.add_argument('--lk-root', default='.',
                        help='Path to LK root directory (default: current directory)')
@@ -430,6 +459,12 @@ def main():
     if not os.path.exists(os.path.join(lk_root, 'makefile')) and not os.path.exists(os.path.join(lk_root, 'Makefile')):
         print(f"Error: {lk_root} doesn't appear to be the LK root directory")
         return 1
+
+    # the launchers run with lk_root as their cwd, so pin a relative BUILDROOT to the
+    # directory it was given in
+    if os.environ.get('BUILDROOT'):
+        os.environ['BUILDROOT'] = os.path.abspath(os.environ['BUILDROOT'])
+        print(f"Build root: {os.environ['BUILDROOT']}")
 
     runner = QEMUTestRunner(lk_root)
 

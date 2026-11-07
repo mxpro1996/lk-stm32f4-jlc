@@ -162,6 +162,11 @@ status_t lapic_set_oneshot_timer(platform_timer_callback callback, void *arg, lk
     } else {
         // set the initial count, which should trigger the timer
         uint64_t ticks = u64_mul_u32_fp32_64(interval, timebase_to_lapic);
+        // A count of 0 stops the timer, which only lapic_cancel_timer() should do.
+        // Treat a 0 interval as "fire as soon as possible" instead.
+        if (ticks == 0) {
+            ticks = 1;
+        }
         if (ticks > UINT32_MAX) {
             ticks = UINT32_MAX;
         }
@@ -245,7 +250,8 @@ void lapic_init_postvm(void) {
         LTRACEF("mapping lapic into kernel\n");
         status_t err = vmm_alloc_physical(vmm_get_kernel_aspace(), "lapic", PAGE_SIZE,
                                           (void **)&lapic_mmio, 0, apic_base & ~0xfff,
-                                          /* vmm_flags */ 0, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+                                          /* vmm_flags */ 0,
+                                          ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_UNCACHED_DEVICE);
         ASSERT(err == NO_ERROR);
         ASSERT(lapic_mmio != NULL);
     }

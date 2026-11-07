@@ -41,6 +41,7 @@ function HELP {
     echo "-h        : for help"
     echo
     echo "All build output written to buildall.log"
+    echo "Build directories go under \$BUILDROOT if set in the environment (default: .)"
     exit 1
 }
 
@@ -105,18 +106,9 @@ if [ -d "$DIR/../toolchain" ]; then
     done
 fi
 
-if (( CLANG || CLANG_LLD )); then
-    if [ -z "$CLANG_BINDIR" ]; then
-        for d in /usr/lib/llvm-*/bin; do
-            if [ -x "$d/clang" ]; then
-                export CLANG_BINDIR="$d"
-                export PATH="$d:$PATH"
-                break
-            fi
-        done
-    elif [ -d "$CLANG_BINDIR" ]; then
-        export PATH="$CLANG_BINDIR:$PATH"
-    fi
+# engine.mk picks the LLVM install when CLANG_BINDIR is not set
+if (( CLANG || CLANG_LLD )) && [ -d "$CLANG_BINDIR" ]; then
+    export PATH="$CLANG_BINDIR:$PATH"
 fi
 
 echo > buildall.log
@@ -196,7 +188,7 @@ for tc in "${TOOLCHAINS[@]}"; do
     for p in $PROJECTS; do
         echo "building $p$BUILDDIR_SUFFIX $WERROR_MSG"
         log env JOBS="$JOBS" "${TC_ARGS[@]}" WERROR=$WERROR UBSAN=$UBSAN DEBUG=$dbg PROJECT=$p nice "$DIR"/make-parallel || FAILED="$FAILED $p$BUILDDIR_SUFFIX"
-        BUILDDIRS+=("build-$p$BUILDDIR_SUFFIX")
+        BUILDDIRS+=("${BUILDROOT:-.}/build-$p$BUILDDIR_SUFFIX")
     done
 done
 done

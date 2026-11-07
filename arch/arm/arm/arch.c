@@ -155,6 +155,10 @@ void arm_secondary_entry(uint asm_cpu_num) {
 
     arm_basic_setup();
 
+#if ARCH_HAS_MMU
+    arm_mmu_init_percpu();
+#endif
+
     /* enable the local L1 cache */
     //arch_enable_cache(ARCH_CACHE_FLAG_UCACHE);
 
@@ -173,7 +177,8 @@ void arm_secondary_entry(uint asm_cpu_num) {
 
     /* we're done, tell the main cpu we're up */
     atomic_add(&secondaries_to_init, -1);
-    smp_mb();
+    // sev is not a memory access, so only a dsb has the store visible before the boot cpu wakes
+    DSB;
     __asm__ volatile("sev");
 
     // Finish secondary cpu initialization and enter the scheduler
@@ -226,7 +231,7 @@ static void arm_basic_setup(void) {
     __asm__ volatile("mcr	p15, 0, %0, c9, c12, 0" :: "r" (en));
 
     /* enable cycle counter */
-    en = (1<<31);
+    en = (1u << 31);
     __asm__ volatile("mcr	p15, 0, %0, c9, c12, 1" :: "r" (en));
 #endif
 
@@ -304,15 +309,6 @@ status_t arm_vtop(addr_t va, addr_t *pa) {
 void arch_chain_load(void *entry, ulong arg0, ulong arg1, ulong arg2, ulong arg3) {
     LTRACEF("entry %p, args 0x%lx 0x%lx 0x%lx 0x%lx\n", entry, arg0, arg1, arg2, arg3);
 
-    /* we are going to shut down the system, start by disabling interrupts */
-    arch_disable_ints();
-
-    /* give target and platform a chance to put hardware into a suitable
-     * state for chain loading.
-     */
-    target_quiesce();
-    platform_quiesce();
-
     paddr_t entry_pa;
     paddr_t loader_pa;
 
@@ -340,26 +336,44 @@ void arch_chain_load(void *entry, ulong arg0, ulong arg1, ulong arg2, ulong arg3
     LTRACEF("loader address %p, phys 0x%lx, surrounding large page 0x%lx\n",
             &arm_chain_load, loader_pa, loader_pa_section);
 
+    /* Identity map two sections around the loader, in case it straddles a
+     * section boundary: in the kernel aspace if it covers the loader, else in a
+     * user aspace of its own, which ends at 1GB. Both ranges are pulled down far
+     * enough to end inside their aspace. The loader aspace is made here, while
+     * allocating is still allowed. */
     arch_aspace_t *aspace;
     bool need_context_switch;
-    // if loader_pa is within the kernel aspace, we can simply use arch_mmu_map to identity map it
-    // if its outside, we need to create a new aspace and context switch to it
+    vaddr_t map_base;
     if (arch_mmu_is_valid_vaddr(&vmm_get_kernel_aspace()->arch_aspace, loader_pa)) {
-      aspace = &vmm_get_kernel_aspace()->arch_aspace;
-      need_context_switch = false;
+        aspace = &vmm_get_kernel_aspace()->arch_aspace;
+        need_context_switch = false;
+        map_base = MIN(loader_pa_section, (vaddr_t)0 - 2 * SECTION_SIZE);
     } else {
-      aspace = malloc(sizeof(*aspace));
-      arch_mmu_init_aspace(aspace, loader_pa_section, SECTION_SIZE, 0);
-      need_context_switch = true;
+        map_base = MIN(loader_pa_section, GB - 2 * SECTION_SIZE);
+        aspace = malloc(sizeof(*aspace));
+        if (!aspace || arch_mmu_init_aspace(aspace, map_base, 2 * SECTION_SIZE, 0) != NO_ERROR) {
+            panic("error creating the loader aspace\n");
+        }
+        need_context_switch = true;
     }
-
-    /* using large pages, map around the target location */
-    arch_mmu_map(aspace, loader_pa_section, loader_pa_section, (2 * SECTION_SIZE / PAGE_SIZE), 0);
-    if (need_context_switch) arch_mmu_context_switch(NULL, aspace);
 #else
     /* for non vm case, just branch directly into it */
     entry_pa = (paddr_t)entry;
     loader_pa = (paddr_t)&arm_chain_load;
+#endif
+
+    /* we are going to shut down the system, start by disabling interrupts */
+    arch_disable_ints();
+
+    /* give target and platform a chance to put hardware into a suitable
+     * state for chain loading.
+     */
+    target_quiesce();
+    platform_quiesce();
+
+#if WITH_KERNEL_VM
+    arm_mmu_chain_load_map(aspace, map_base, 2);
+    if (need_context_switch) arch_mmu_context_switch(NULL, aspace);
 #endif
 
     LTRACEF("disabling instruction/data cache\n");

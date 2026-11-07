@@ -2,12 +2,17 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
+MODULE_OPTIONS += test
+
 MODULE_DEFINES := \
 	MSPACES=1 \
 	GBL_EFI_DISABLE_CPP_ENUMS=1 \
 
 MODULE_INCLUDES += \
-	lib/watchdog/include \
+	$(LKROOT)/lib/watchdog/include \
+
+MODULE_WEAK_DEPS += \
+	lib/watchdog \
 
 MODULE_DEPS += \
 	lib/bio \
@@ -18,6 +23,8 @@ MODULE_DEPS += \
 	lib/libcpp \
 
 MODULE_SRCS += \
+	$(LOCAL_DIR)/io_buffer.cpp \
+	$(LOCAL_DIR)/image_permissions.cpp \
 	$(LOCAL_DIR)/uefi.cpp \
 	$(LOCAL_DIR)/relocation.cpp \
 	$(LOCAL_DIR)/text_protocol.cpp \

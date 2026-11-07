@@ -86,7 +86,7 @@ static void insert_in_run_queue_head(thread_t *t) {
     DEBUG_ASSERT(spin_lock_held(&thread_lock));
 
     list_add_head(&run_queue[t->priority], &t->queue_node);
-    run_queue_bitmap |= (1<<t->priority);
+    run_queue_bitmap |= (1U << t->priority);
 }
 
 static void insert_in_run_queue_tail(thread_t *t) {
@@ -97,7 +97,7 @@ static void insert_in_run_queue_tail(thread_t *t) {
     DEBUG_ASSERT(spin_lock_held(&thread_lock));
 
     list_add_tail(&run_queue[t->priority], &t->queue_node);
-    run_queue_bitmap |= (1<<t->priority);
+    run_queue_bitmap |= (1U << t->priority);
 }
 
 static void wakeup_cpu_for_thread(thread_t *t)
@@ -114,7 +114,9 @@ static void wakeup_cpu_for_thread(thread_t *t)
 static void init_thread_struct(thread_t *t, const char *name) {
     memset(t, 0, sizeof(thread_t));
     t->magic = THREAD_MAGIC;
-    thread_set_pinned_cpu(t, -1);
+#if WITH_SMP
+    t->pinned_cpu = -1;
+#endif
     strlcpy(t->name, name, sizeof(t->name));
 }
 
@@ -274,7 +276,7 @@ static bool thread_is_real_time_or_idle(thread_t *t) {
  *
  * @param t  Thread to resume
  *
- * @return NO_ERROR on success, ERR_NOT_SUSPENDED if thread was not suspended.
+ * @return NO_ERROR. A thread that is not suspended keeps its state.
  */
 status_t thread_resume(thread_t *t) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
@@ -449,13 +451,13 @@ static thread_t *get_top_thread(int cpu) {
                 list_delete(&newthread->queue_node);
 
                 if (list_is_empty(&run_queue[next_queue]))
-                    run_queue_bitmap &= ~(1<<next_queue);
+                    run_queue_bitmap &= ~(1U << next_queue);
 
                 return newthread;
             }
         }
 
-        local_run_queue_bitmap &= ~(1<<next_queue);
+        local_run_queue_bitmap &= ~(1U << next_queue);
     }
     /* no threads to run, select the idle thread for this cpu */
     return idle_thread(cpu);
@@ -739,9 +741,18 @@ static enum handler_return thread_sleep_handler(timer_t *timer, lk_time_t now, v
     t->state = THREAD_READY;
     insert_in_run_queue_head(t);
 
+    // It may have been pinned to another CPU while it slept. Only that CPU can
+    // run it, so wake that CPU; a local reschedule would not pick it up.
+    enum handler_return ret = INT_RESCHEDULE;
+    const int pinned_cpu = thread_pinned_cpu(t);
+    if (pinned_cpu >= 0 && (uint)pinned_cpu != arch_curr_cpu_num()) {
+        wakeup_cpu_for_thread(t);
+        ret = INT_NO_RESCHEDULE;
+    }
+
     THREAD_UNLOCK(state);
 
-    return INT_RESCHEDULE;
+    return ret;
 }
 
 /**
@@ -847,6 +858,39 @@ void thread_set_priority(int priority) {
 
     THREAD_UNLOCK(state);
 }
+
+#if WITH_SMP
+void thread_set_pinned_cpu(thread_t *t, int cpu) {
+    DEBUG_ASSERT(t->magic == THREAD_MAGIC);
+    DEBUG_ASSERT(cpu >= -1 && cpu < SMP_MAX_CPUS);
+
+    bool ints_disabled = arch_ints_disabled();
+    THREAD_LOCK(state);
+
+    t->pinned_cpu = cpu;
+
+    if (cpu >= 0) {
+        if (t->state == THREAD_RUNNING && t == get_current_thread() &&
+            (uint)cpu != arch_curr_cpu_num()) {
+            DEBUG_ASSERT(!ints_disabled);
+            DEBUG_ASSERT(mp_is_cpu_active(cpu));
+            DEBUG_ASSERT(!thread_is_idle(t));
+
+            t->state = THREAD_READY;
+            insert_in_run_queue_head(t);
+            wakeup_cpu_for_thread(t);
+            thread_resched();
+
+            // Another thread may have changed our affinity while we were queued.
+            DEBUG_ASSERT(t->pinned_cpu < 0 || arch_curr_cpu_num() == (uint)t->pinned_cpu);
+        } else if (t->state == THREAD_READY) {
+            wakeup_cpu_for_thread(t);
+        }
+    }
+
+    THREAD_UNLOCK(state);
+}
+#endif
 
 /**
  * @brief  Become an idle thread
@@ -1047,10 +1091,9 @@ void dump_all_threads(void) {
 }
 
 #if THREAD_STATS
-void dump_threads_stats(void) {
+void dump_threads_stats_unlocked(void) {
     thread_t *t;
 
-    THREAD_LOCK(state);
     list_for_every_entry (&thread_list, t, thread_t, thread_list_node) {
         if (t->magic != THREAD_MAGIC) {
             dprintf(INFO, "bad magic on thread struct %p, aborting.\n", t);
@@ -1068,6 +1111,11 @@ void dump_threads_stats(void) {
                 percent / 100, percent % 100);
         dprintf(INFO, "\t\tLast time run: %lld\n", t->stats.last_run_timestamp);
     }
+}
+
+void dump_threads_stats(void) {
+    THREAD_LOCK(state);
+    dump_threads_stats_unlocked();
     THREAD_UNLOCK(state);
 }
 #endif

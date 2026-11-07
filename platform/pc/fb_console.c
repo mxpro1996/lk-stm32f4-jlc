@@ -7,7 +7,6 @@
 #include <dev/display.h>
 #include <inttypes.h>
 #include <kernel/vm.h>
-#include <kernel/spinlock.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
@@ -27,7 +26,6 @@ static void *display_fb_region;
 static bool display_initialized = false;
 static uint32_t foreground_color = 0x00FFFFFF;
 static uint32_t background_color = 0x00000000;
-static spin_lock_t fb_console_lock = SPIN_LOCK_INITIAL_VALUE;
 
 /* Double buffering for improved scroll performance */
 static void *display_backbuffer = NULL;
@@ -113,7 +111,7 @@ static void fb_console_init_common(const struct fb_console_boot_info *boot_info)
     status_t status = vmm_alloc_physical(vmm_get_kernel_aspace(), "display_fb", fb_map_size,
                                          &display_fb_region, 0, fb_map_base,
                                          0, /* vmm_flags */
-                                         ARCH_MMU_FLAG_CACHED);
+                                         ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
     if (status != NO_ERROR) {
         TRACEF("Failed to map framebuffer at %#" PRIx64 " (size %#zx): %d\n",
                boot_info->framebuffer_addr, fb_map_size, status);
@@ -170,7 +168,7 @@ static void fb_console_init_common(const struct fb_console_boot_info *boot_info)
         vmm_alloc(vmm_get_kernel_aspace(), "display_backbuffer", buffer_size,
                   &display_backbuffer, 0, /* align_log2: 0 for default alignment */
                   0,                      /* vmm_flags: 0 for defaults */
-                  ARCH_MMU_FLAG_CACHED);
+                  ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
 
         if (backbuffer_status != NO_ERROR) {
          TRACEF("ERROR: Failed to allocate backbuffer via VM (%zu bytes): %d\n", buffer_size,
@@ -339,8 +337,6 @@ void fb_console_dputc(char c) {
         return;
     }
 
-    arch_interrupt_saved_state_t state = spin_lock_irqsave(&fb_console_lock);
-
     switch (c) {
         case '\t':
             curr_x = (curr_x + 8) & ~7; // Move to next tab
@@ -384,7 +380,5 @@ void fb_console_dputc(char c) {
         scroll();
         curr_y = view_window.y2;
     }
-
-    spin_unlock_irqrestore(&fb_console_lock, state);
 }
 
